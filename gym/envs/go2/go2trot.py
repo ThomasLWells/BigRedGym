@@ -243,4 +243,5 @@ class Go2Trot(LeggedRobot):
     def _reward_tracking_base_height(self):
         error = self.commands[:, 3] - self.base_height.squeeze(1)
         scale = self.cfg.reward_settings.base_height_tracking_scale
-        return self._sqrdexp(error / scale)
+        error = error / scale
+        return self._sqrdexp(error) - 0.2 * error.abs()

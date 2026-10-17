@@ -20,7 +20,7 @@ class Go2TrotCfg(Go2Cfg):
         root_pos_range = [
             [0.0, 0.0],  # x
             [0.0, 0.0],  # y
-            [0.30, 0.40],  # z
+            [0.25, 0.4],  # z
             [0.0, 0.0],  # roll
             [0.0, 0.0],  # pitch
             [0.0, 0.0],  # yaw
@@ -66,7 +66,7 @@ class Go2TrotCfg(Go2Cfg):
             lin_vel_x = [-0.5, 0.0, 0.5, 1.0, 2.0]
             lin_vel_y = 0.5
             yaw_vel = 1.5
-            base_height = [0.1, 0.40]
+            base_height = [0.25, 0.40]
 
     class push_robots(Go2Cfg.push_robots):
         toggle = True

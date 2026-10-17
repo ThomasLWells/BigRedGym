@@ -88,7 +88,9 @@ def test_base_height_tracking_peaks_at_the_commanded_height_symmetrically():
     assert reward.shape == (3,)
     # Exact tracking is the optimum, and the term is a bonus in [0, 1].
     assert reward[1].item() == pytest.approx(1.0)
-    assert torch.all(reward > 0.0)
+    assert reward[1].item() == pytest.approx(1.0)
+    assert torch.all(reward <= 1.0)
+    assert reward[0].item() < 0.0 #
     # Two-sided, unlike _reward_min_base_height: overshooting the command
     # costs exactly as much as falling short of it.
     assert reward[0].item() == pytest.approx(reward[2].item(), rel=1e-5)
