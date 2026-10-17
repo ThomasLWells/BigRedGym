@@ -36,19 +36,9 @@ class HeightTrace:
             color="#2a78d6",
             lw=2,
             drawstyle="steps-post",
-            label="commanded",
+            label="command",
         )
-        ax.plot(t, measured, color="#eb6834", lw=2, label="measured")
-
-        ax.axhline(0.411, color="#52514e", lw=1, alpha=0.5)
-        ax.annotate(
-            "kinematic ceiling 0.411 m",
-            (t[-1], 0.411),
-            ha="right",
-            va="bottom",
-            fontsize=8,
-            color="#52514e",
-        )
+        ax.plot(t, measured, color="#eb6834", lw=2, label="actual")
 
         ax.set_xlabel("time (s)", color="#52514e")
         ax.set_ylabel("base height (m)", color="#52514e")
@@ -64,6 +54,6 @@ class HeightTrace:
             path.replace(".png", ".csv"),
             np.column_stack([t, commanded, measured]),
             delimiter=",",
-            header="t_s,commanded_m,measured_m",
+            header="t_s,command_m,actual_m",
             comments="",
         )
