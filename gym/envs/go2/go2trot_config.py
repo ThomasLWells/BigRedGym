@@ -178,7 +178,7 @@ class Go2TrotRunnerCfg(Go2RunnerCfg):
                 action_rate2 = 0.05
                 trot_support = 3.0
                 swing_contact = 3.0
-                reference_traj = 3.0
+                reference_traj = 1.0
 
             class termination_weight:
                 termination = 0.01
