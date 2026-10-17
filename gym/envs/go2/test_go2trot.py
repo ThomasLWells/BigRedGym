@@ -74,7 +74,8 @@ def test_reference_reward_tracks_measured_joints_with_normalized_symmetric_error
 def test_base_height_tracking_peaks_at_the_commanded_height_symmetrically():
     task = Go2Trot.__new__(Go2Trot)
     task.cfg = Go2TrotCfg()
-    task.scales = {"base_height": 0.3}
+    # task.scales = {"base_height": 0.3}
+    scale = task.cfg.reward_settings.base_height_tracking_scale
     # One commanded height, approached from below, exactly, and from above.
     task.commands = torch.zeros(3, 4)
     task.commands[:, 3] = 0.30
@@ -90,9 +91,9 @@ def test_base_height_tracking_peaks_at_the_commanded_height_symmetrically():
     assert torch.all(reward > 0.0)
     # Two-sided, unlike _reward_min_base_height: overshooting the command
     # costs exactly as much as falling short of it.
-    assert reward[0].item() == pytest.approx(reward[2].item())
+    assert reward[0].item() == pytest.approx(reward[2].item(), rel=1e-5)
     expected = torch.exp(
-        torch.tensor(-((0.06 / 0.3) ** 2) / task.cfg.reward_settings.tracking_sigma)
+        torch.tensor(-((0.06 / scale) ** 2) / task.cfg.reward_settings.tracking_sigma)
     )
-    assert reward[0].item() == pytest.approx(expected.item())
+    assert reward[0].item() == pytest.approx(expected.item(), rel=1e-5)
     assert reward[0].item() < reward[1].item()

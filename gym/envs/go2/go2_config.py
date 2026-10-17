@@ -138,7 +138,8 @@ class Go2Cfg(LeggedRobotCfg):
         soft_dof_vel_limit = 0.9
         soft_torque_limit = 0.9
         max_contact_force = 600.0
-        base_height_target = 0.05
+        base_height_target = BASE_HEIGHT_REF
+        base_height_tracking_scale = 0.05
         tracking_sigma = 0.25
 
     class scaling(LeggedRobotCfg.scaling):
