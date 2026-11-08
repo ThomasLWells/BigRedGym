@@ -36,6 +36,16 @@ class Go2Stand(Go2):
             device=self.device,
         )
 
+        # Horizontal position each support foot was planted at, refreshed on
+        # reset. Drift from it is the slip measure -- see _reward_front_feet_slip.
+        self._front_feet_anchor = torch.zeros(
+            self.num_envs,
+            len(self.front_feet_indices),
+            2,
+            dtype=torch.float,
+            device=self.device,
+        )
+
     def _reset_idx(self, reset_mask):
         super()._reset_idx(reset_mask)
         # dof_pos_target is a residual: _compute_torques adds default_dof_pos
@@ -47,6 +57,12 @@ class Go2Stand(Go2):
         masked_update(
             self.dof_pos_history,
             self.dof_pos_target.tile(1, 3),
+            reset_mask,
+        )
+        # Re-anchor the support feet wherever the reset put them.
+        masked_update(
+            self._front_feet_anchor,
+            self._rigid_body_pos[:, self.front_feet_indices, :2],
             reset_mask,
         )
 
@@ -68,11 +84,18 @@ class Go2Stand(Go2):
             device=self.device,
         )
 
-    def _foot_load(self, indices):
-        """Upward foot force as a fraction of body weight, smoothed to [0, 1]."""
+    def _foot_load(self, indices, share=1.0):
+        """Upward foot force as a fraction of its expected share of body weight.
+
+        ``share`` is how much of the robot's weight one of these feet carries
+        when the pose is held. Normalizing by the total instead caps a
+        two-footed support term at half its weight, since neither foot can
+        read more than 0.5. The division has to happen before the smoothstep,
+        which is why this is a parameter rather than a factor on the result.
+        """
         load = torch.clamp(
             self.contact_forces[:, indices, 2]
-            / (9.81 * self._backend.link_mass.sum(dim=1, keepdim=True)),
+            / (share * 9.81 * self._backend.link_mass.sum(dim=1, keepdim=True)),
             min=0.0,
             max=1.0,
         )
@@ -116,16 +139,37 @@ class Go2Stand(Go2):
 
         A mean over the pair would let one foot carry everything while the
         other hops; the minimum makes a single lifted foot a full failure,
-        which is what keeps the support stance from stepping.
+        which is what keeps the support stance from stepping. Two feet carry
+        the robot, so each one's share is half the body weight.
         """
-        return self._foot_load(self.front_feet_indices).amin(dim=1)
+        return self._foot_load(self.front_feet_indices, share=0.5).amin(dim=1)
+
+    def _reward_front_feet_drift(self):
+        """Penalize the support feet moving from where they were planted.
+
+        Displacement rather than velocity, because the feet are 22 mm spheres:
+        a foot rotating about a stationary contact point moves its body origin
+        at radius x omega with nothing actually sliding, and that rotation is
+        the ankle strategy this task depends on (2 rad/s reads as 0.044 m/s of
+        false slip). Drift separates the two -- rolling is bounded by the
+        radius, sliding accumulates.
+
+        Linear rather than a squared exponential so the gradient is constant
+        at every magnitude; a sqrdexp would go flat once a foot has already
+        skated far, which is when the signal is needed most.
+        """
+        drift = (
+            self._rigid_body_pos[:, self.front_feet_indices, :2]
+            - self._front_feet_anchor
+        )
+        return -torch.mean(torch.norm(drift, dim=-1), dim=1)
 
     def _reward_front_feet_slip(self):
-        """Penalize horizontal motion of the support feet -- they stay planted.
+        """Penalize support-foot speed, as a damper on top of the drift term.
 
-        A linear penalty rather than a squared exponential, so the gradient is
-        constant at every magnitude: a sqrdexp would go flat exactly when a
-        foot is sliding badly, which is when the signal is needed most.
+        Kept at a low weight: drift alone permits fast oscillation around the
+        anchor, but this measure cannot distinguish sliding from the foot
+        rolling in place, so it should not be the primary signal.
         """
         velocity = self._rigid_body_lin_vel[:, self.front_feet_indices, :2]
         return -torch.mean(torch.norm(velocity, dim=-1), dim=1)

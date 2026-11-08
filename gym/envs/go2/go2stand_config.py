@@ -202,10 +202,15 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 front_feet_support = 2.0
                 # Keep the support feet planted, so balance comes from
                 # articulating the front legs rather than repositioning the
-                # feet. Raw m/s, so the magnitude needs tuning: foot speeds
-                # during balance run 0.05-0.2 m/s, worth -0.25 to -1.0 here
-                # against a total reward around 11.
-                front_feet_slip = 5.0
+                # feet. Drift is the primary signal (metres from where the
+                # foot was planted): at this weight 2 cm costs 0.1 and 10 cm
+                # costs 0.5, against a total reward around 11.
+                front_feet_drift = 5.0
+                # Speed only damps oscillation about the anchor. Low weight
+                # because it cannot tell sliding from the foot rolling in
+                # place, and at 5.0 it plateaued at -0.5 by charging the
+                # policy for the ankle motion the task needs.
+                front_feet_slip = 1.0
                 rear_feet_air = 1.0
                 # default_dof_pos is the handstand posture, so this anchors the
                 # support configuration rather than a normal stance.
