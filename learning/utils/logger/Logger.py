@@ -170,6 +170,33 @@ class Logger:
         for category in self.iteration_logs.logs.keys():
             self.iteration_logs.log(category)
 
+    def reward_histograms(self):
+        """Per-episode reward distributions behind this iteration's averages.
+
+        ``EpisodicLogs.finished_episodes`` already buffers the last
+        ``window_size`` finished episodes for every reward term (plus "time",
+        the episode lengths), and ``get_average_rewards`` reduces each buffer
+        to the scalar that is otherwise the only thing logged. These are the
+        same samples, unreduced, so a mean of 0.5 can be told apart from a
+        bimodal split either side of it.
+
+        Only the filled prefix of each buffer is used: before the window has
+        turned over once, the tail is still zeros and would show as a spike at
+        the origin. Returns {} until at least one episode has finished.
+        """
+        filled = min(
+            self.reward_logs.finished_episode_count,
+            self.reward_logs.window_size,
+        )
+        if filled == 0:
+            return {}
+        return {
+            f"rewards_hist/{key}": wandb.Histogram(
+                buffer[:filled].detach().cpu().numpy()
+            )
+            for key, buffer in self.reward_logs.finished_episodes.items()
+        }
+
     def log_to_wandb(self):
         def prepend_to_keys(prefix, dictionary):
             return {prefix + "/" + key: val for key, val in dictionary.items()}
@@ -182,7 +209,7 @@ class Logger:
             for key, val in self.iteration_logs.get_all_logs(category).items()
         }
 
-        wandb.log({**averages, **category_logs})
+        wandb.log({**averages, **category_logs, **self.reward_histograms()})
 
     def tic(self, category="default"):
         self.timer.tic(category)
