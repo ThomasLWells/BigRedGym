@@ -112,8 +112,23 @@ class Go2Stand(Go2):
     # ------------ handstand-specific rewards ----------------
 
     def _reward_front_feet_support(self):
-        """Reward the front feet actually carrying the robot."""
-        return self._foot_load(self.front_feet_indices).mean(dim=1)
+        """Both support feet loaded at once.
+
+        A mean over the pair would let one foot carry everything while the
+        other hops; the minimum makes a single lifted foot a full failure,
+        which is what keeps the support stance from stepping.
+        """
+        return self._foot_load(self.front_feet_indices).amin(dim=1)
+
+    def _reward_front_feet_slip(self):
+        """Penalize horizontal motion of the support feet -- they stay planted.
+
+        A linear penalty rather than a squared exponential, so the gradient is
+        constant at every magnitude: a sqrdexp would go flat exactly when a
+        foot is sliding badly, which is when the signal is needed most.
+        """
+        velocity = self._rigid_body_lin_vel[:, self.front_feet_indices, :2]
+        return -torch.mean(torch.norm(velocity, dim=-1), dim=1)
 
     def _reward_rear_feet_air(self):
         """Penalize load on the rear feet -- they have to leave the ground."""

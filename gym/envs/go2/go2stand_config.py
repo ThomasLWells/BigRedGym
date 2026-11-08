@@ -41,8 +41,11 @@ CALF_JITTER = 0.03
 
 class Go2StandCfg(Go2Cfg):
     class env(Go2Cfg.env):
-        # A hold, not a stride: long enough to show the pose is stable.
-        episode_length_s = 6
+        # A hold, not a stride. Raised from 6 s because the first stage-1 run
+        # saturated at 5.991 s of a 6 s cap, leaving no headroom to tell "just
+        # barely holds" from "rock solid". Note the cap alone does not make the
+        # policy value longer holds -- see algorithm.discount_horizon.
+        episode_length_s = 10
 
     class init_state(Go2Cfg.init_state):
         # Policy targets are offsets from this posture, so action = 0 holds the
@@ -197,6 +200,12 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 orientation = 3.0
                 min_base_height = 2.0
                 front_feet_support = 2.0
+                # Keep the support feet planted, so balance comes from
+                # articulating the front legs rather than repositioning the
+                # feet. Raw m/s, so the magnitude needs tuning: foot speeds
+                # during balance run 0.05-0.2 m/s, worth -0.25 to -1.0 here
+                # against a total reward around 11.
+                front_feet_slip = 5.0
                 rear_feet_air = 1.0
                 # default_dof_pos is the handstand posture, so this anchors the
                 # support configuration rather than a normal stance.
@@ -217,6 +226,14 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
 
             class termination_weight:
                 termination = 0.01
+
+    class algorithm(Go2RunnerCfg.algorithm):
+        # Derive gamma from a time horizon rather than inheriting 0.99, which
+        # at 100 Hz gives the critic only 1.0 s of lookahead -- shorter than
+        # the episode, so the policy could not value a longer hold however
+        # high the cap was set. set_discount_rates() converts this using
+        # ctrl_dt (task_registry.set_discount_rates).
+        discount_horizon = 3.0
 
     class runner(Go2RunnerCfg.runner):
         experiment_name = "go2stand"
