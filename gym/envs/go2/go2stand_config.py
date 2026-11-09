@@ -205,13 +205,13 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # feet. Drift is the primary signal (metres from where the
                 # foot was planted): at this weight 2 cm costs 0.1 and 10 cm
                 # costs 0.5, against a total reward around 11.
-                front_feet_drift = 30.0
+                front_feet_drift = 10.0
                 # Speed only damps oscillation about the anchor. Low weight
                 # because it cannot tell sliding from the foot rolling in
                 # place, and at 5.0 it plateaued at -0.5 by charging the
                 # policy for the ankle motion the task needs.
                 front_feet_slip = 1.0
-                rear_feet_air = 1.0
+                rear_feet_air = 0.1
                 # default_dof_pos is the handstand posture, so this anchors the
                 # support configuration rather than a normal stance.
                 dof_near_home = 0.05
