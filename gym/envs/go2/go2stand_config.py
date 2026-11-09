@@ -223,11 +223,14 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # feet, which is genuinely more stable, so the policy would stay
                 # bunched up rather than extend between corrections.
                 rear_dof_near_home = 0.05
-                # Regularizers.
-                ang_vel_xy = 0.05
+                # Regularizers. Raised 10x: at the previous weights these were
+                # each worth about 0.5% of a total reward near 7.7, so jerky
+                # motion and body rotation were effectively free. ang_vel_xy
+                # covers roll and pitch only -- yaw is still uncosted.
+                ang_vel_xy = 0.5
                 torques = 5.0e-6
-                action_rate = 0.1
-                action_rate2 = 0.05
+                action_rate = 1.0
+                action_rate2 = 0.5
                 # Meaningless here: there is no velocity command to track, and
                 # vertical motion is how the robot gets into the pose.
                 tracking_lin_vel = 0.0
@@ -247,6 +250,10 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
         # high the cap was set. set_discount_rates() converts this using
         # ctrl_dt (task_registry.set_discount_rates).
         discount_horizon = 3.0
+        # 0.01 is inherited from locomotion and keeps paying the policy to
+        # widen its action distribution -- action_std rose 1.00 -> 1.68 over
+        # 1500 iterations, which is most of the jerkiness. Go2Trot uses 0.001.
+        entropy_coef = 0.001
 
     class runner(Go2RunnerCfg.runner):
         experiment_name = "go2stand"

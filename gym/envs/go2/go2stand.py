@@ -196,12 +196,17 @@ class Go2Stand(Go2):
         Linear rather than a squared exponential so the gradient is constant
         at every magnitude; a sqrdexp would go flat once a foot has already
         skated far, which is when the signal is needed most.
+
+        The maximum over the pair, not the mean: a pivot about one planted
+        foot sweeps the other through twice the distance the mean would
+        report, so averaging halves the cost of exactly the behaviour this
+        term exists to stop. Mirrors the amin in _reward_front_feet_support.
         """
         drift = (
             self._rigid_body_pos[:, self.front_feet_indices, :2]
             - self._front_feet_anchor
         )
-        return -torch.mean(torch.norm(drift, dim=-1), dim=1)
+        return -torch.amax(torch.norm(drift, dim=-1), dim=1)
 
     def _reward_front_feet_slip(self):
         """Penalize support-foot speed, as a damper on top of the drift term.
