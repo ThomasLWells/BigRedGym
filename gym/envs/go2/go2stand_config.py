@@ -213,8 +213,16 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 front_feet_slip = 1.0
                 rear_feet_air = 0.1
                 # default_dof_pos is the handstand posture, so this anchors the
-                # support configuration rather than a normal stance.
-                dof_near_home = 0.05
+                # support configuration rather than a normal stance. Front legs
+                # only now, so the ceiling is 3.0 rather than 6.0 -- the weight
+                # is unchanged from the original because the term halved with it.
+                dof_near_home = 0.5
+                # The rear pair is the reaction mass for balancing, so moving it
+                # is 10x cheaper than moving the support legs. Not zero: with no
+                # pull at all, curling draws the centre of mass down toward the
+                # feet, which is genuinely more stable, so the policy would stay
+                # bunched up rather than extend between corrections.
+                rear_dof_near_home = 0.05
                 # Regularizers.
                 ang_vel_xy = 0.05
                 torques = 5.0e-6

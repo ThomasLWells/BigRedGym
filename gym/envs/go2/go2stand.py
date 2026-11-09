@@ -24,10 +24,20 @@ class Go2Stand(Go2):
         # swap which pair is expected to carry the robot.
         foot_names = self.robot_layout.body_groups["feet"]
         self.front_feet_indices = self.feet_indices.index_select(
-            0, self._foot_subset(foot_names, ("FL", "FR"))
+            0, self._prefix_subset(foot_names, ("FL", "FR"))
         )
         self.rear_feet_indices = self.feet_indices.index_select(
-            0, self._foot_subset(foot_names, ("RL", "RR"))
+            0, self._prefix_subset(foot_names, ("RL", "RR"))
+        )
+
+        # Columns of the full-DOF tensors belonging to each leg pair. Resolved
+        # through actuated_dof_indices rather than used directly, because the
+        # actuated list may be a subset of the canonical DOF order.
+        self.front_dof_indices = self.actuated_dof_indices.index_select(
+            0, self._prefix_subset(self.actuated_dof_names, ("FL", "FR"))
+        )
+        self.rear_dof_indices = self.actuated_dof_indices.index_select(
+            0, self._prefix_subset(self.actuated_dof_names, ("RL", "RR"))
         )
 
         self._target_projected_gravity = torch.tensor(
@@ -77,9 +87,10 @@ class Go2Stand(Go2):
         )
         self.terminated |= attitude_error > self.cfg.termination.max_attitude_error
 
-    def _foot_subset(self, foot_names, prefixes):
+    def _prefix_subset(self, names, prefixes):
+        """Positions in ``names`` whose entry starts with one of ``prefixes``."""
         return torch.tensor(
-            [i for i, name in enumerate(foot_names) if name.startswith(prefixes)],
+            [i for i, name in enumerate(names) if name.startswith(prefixes)],
             dtype=torch.long,
             device=self.device,
         )
@@ -132,7 +143,35 @@ class Go2Stand(Go2):
         ) / self.cfg.reward_settings.base_height_tracking_scale
         return self._sqrdexp(error) - 0.2 * error.abs()
 
+    def _reward_dof_near_home(self):
+        """Hold the support posture -- front legs only.
+
+        Go2's version anchors all twelve joints to default_dof_pos, which is a
+        direct penalty on moving the rear legs at all. They are the reaction
+        mass this task wants to balance with, so they are split out into
+        _reward_rear_dof_near_home at a much lower weight. Restricting from
+        twelve joints to six halves this term's ceiling, so its weight is
+        unchanged to keep the front anchoring exactly as strong as before.
+        """
+        error = (self.dof_pos - self.default_dof_pos) / self.scales["dof_pos_obs"]
+        return torch.sum(
+            self._sqrdexp(error.index_select(1, self.front_dof_indices)), dim=1
+        )
+
     # ------------ handstand-specific rewards ----------------
+
+    def _reward_rear_dof_near_home(self):
+        """Weak pull returning the rear legs to the extended posture.
+
+        Weak, not absent: curling the rear legs draws the centre of mass down
+        toward the feet, which is genuinely more stable, so with no pull at
+        all the policy has an incentive to bunch them up permanently rather
+        than extend between corrections.
+        """
+        error = (self.dof_pos - self.default_dof_pos) / self.scales["dof_pos_obs"]
+        return torch.sum(
+            self._sqrdexp(error.index_select(1, self.rear_dof_indices)), dim=1
+        )
 
     def _reward_front_feet_support(self):
         """Both support feet loaded at once.
