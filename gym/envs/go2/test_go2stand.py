@@ -182,13 +182,20 @@ def test_degenerate_foot_separation_does_not_produce_nan():
     assert torch.isfinite(task._support_rot).all()
 
 
-def _reward_task(offset=(0.0, 0.0), height=HEIGHT, momentum=(0.0, 0.0, 0.0), drift=0.0):
+def _reward_task(
+    offset=(0.0, 0.0),
+    height=HEIGHT,
+    momentum=(0.0, 0.0, 0.0),
+    drift=0.0,
+    com_vel=(0.0, 0.0, 0.0),
+):
     task = Go2Stand.__new__(Go2Stand)
     task.cfg = Go2StandCfg()
     task.num_envs = 1
     task.device = "cpu"
     task.com_offset = torch.tensor([list(offset)])
     task.com_height = torch.tensor([[height]])
+    task.com_vel = torch.tensor([list(com_vel)])
     task.support_momentum = torch.tensor([list(momentum)])
     # One foot sitting still, the other displaced by ``drift``.
     task.front_feet_indices = torch.tensor([0, 1])
@@ -204,11 +211,28 @@ def test_every_reward_peaks_at_exactly_one_at_the_goal():
         task._reward_balance_momentum,
         task._reward_balance_offset,
         task._reward_com_height,
+        task._reward_com_vel_xy,
         task._reward_front_feet_drift,
         task._reward_balance_alive,
     ):
         assert reward().item() == pytest.approx(1.0)
         assert reward().shape == (1,)
+
+
+def test_vertical_com_velocity_is_free_but_horizontal_is_not():
+    """The reduced-order model's own split. Raising and lowering the centre of
+    mass is the control authority the paper studies, so it must not be priced;
+    horizontal travel means the robot is relocating rather than balancing."""
+    speed = Go2StandCfg.reward_settings.com_vel_tolerance
+
+    rising = _reward_task(com_vel=(0.0, 0.0, 4.0 * speed))
+    assert rising._reward_com_vel_xy().item() == pytest.approx(1.0)
+
+    for direction in ((speed, 0.0, 0.0), (0.0, speed, 0.0)):
+        moving = _reward_task(com_vel=direction)._reward_com_vel_xy()
+        # Isotropic in the horizontal plane: stepping is equally wrong in any
+        # direction, unlike the offset and momentum terms.
+        assert moving.item() == pytest.approx(math.exp(-4.0) - 0.2, rel=1e-5)
 
 
 def test_tolerances_are_anisotropic_and_not_transposed():
@@ -298,13 +322,18 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     gradient would point at falling faster.
     """
     far = _reward_task(
-        offset=(100.0, 0.0), height=-100.0, momentum=(100.0, 0.0, 0.0), drift=100.0
+        offset=(100.0, 0.0),
+        height=-100.0,
+        momentum=(100.0, 0.0, 0.0),
+        drift=100.0,
+        com_vel=(100.0, 0.0, 0.0),
     )
     floor = math.exp(-4 * 3.0**2) - 0.6
     for reward in (
         far._reward_balance_momentum,
         far._reward_balance_offset,
         far._reward_com_height,
+        far._reward_com_vel_xy,
         far._reward_front_feet_drift,
     ):
         assert reward().item() == pytest.approx(floor, abs=1e-6)
@@ -317,7 +346,10 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     shaped = (
         weights.balance_momentum
         + weights.balance_offset
-        + weights.com_height
+        + weights.com_vel_xy
         + weights.front_feet_drift
     )
     assert weights.balance_alive + floor * shaped > 0.0
+    # com_height is off: an absent key, not a zero, because this weights class
+    # does not inherit. If it is ever re-enabled it joins the sum above.
+    assert not hasattr(weights, "com_height")

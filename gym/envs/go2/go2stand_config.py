@@ -194,6 +194,21 @@ class Go2StandCfg(Go2Cfg):
         # Metres a support foot may slide from where it was planted, per error
         # unit. 2 cm scores 0.45, 5 cm scores -0.18, 15 cm bottoms out.
         foot_drift_tolerance = 0.05
+        # Metres per second of HORIZONTAL centre-of-mass speed per error unit.
+        # Vertical speed is deliberately uncosted -- raising and lowering the
+        # centre of mass is the control authority the reduced-order model is
+        # about, and at reset the vertical component (0.066 m/s) is already
+        # larger than the horizontal one.
+        #
+        # Measured, over 256 envs: horizontal speed is 0.037 m/s at reset
+        # (p95 0.060), 0.088 while the pose settles under zero actions, and
+        # 0.66-0.89 at the termination boundary. At 0.25 the reset draw -- an
+        # initial condition the policy does not control -- scores 0.885, the
+        # settling transient 0.54, a 0.3 m/s translation -0.24, and a fall
+        # bottoms out. Resolution is deliberately concentrated at the low end,
+        # since that is where this term says something balance_momentum does
+        # not; in a real fall the two saturate together.
+        com_vel_tolerance = 0.25
         # In units of m*h*sqrt(g*h) = 22.6 kg m^2/s, the momentum of the whole
         # robot tipping at the pendulum's natural rate. Measured anchors, not
         # estimated ones: whole-body inertia about the contact line is
@@ -299,7 +314,19 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # for 1.2 s score higher (8.53) than balancing for 10 s (7.69).
                 balance_momentum = 3.0
                 balance_offset = 2.0
-                com_height = 1.0
+                # Horizontal centre-of-mass speed only. Took com_height's
+                # weight in a straight 1-for-1 swap, so the goal total stays
+                # 15.0 and the floor arithmetic below is unchanged -- the next
+                # run stays directly comparable to the previous config.
+                #
+                # com_height is omitted entirely rather than set to 0.0: this
+                # weights class does not inherit, so an absent key simply does
+                # not exist, and zero-weighted keys are pruned at startup
+                # anyway. Holding a height does not itself buy stability, and
+                # the physics already discourages the crouch it guarded
+                # against -- see Go2Stand._reward_com_height, which stays on
+                # the class so re-enabling it is one line here.
+                com_vel_xy = 1.0
                 # The pendulum's pivot tracks the live feet, so the balance
                 # terms no longer notice a foot sliding. These two charge for
                 # foot motion directly instead -- which is the honest way

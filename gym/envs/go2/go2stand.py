@@ -23,11 +23,17 @@ after any drift, pointing the robot away from the support it is actually
 standing on. Keeping p live and charging for drift separately
 (_reward_front_feet_drift) bounds pdot instead, which bounds the error term.
 
-That is the core of the reward, plus a loose centre-of-mass height target to
-pick which fixed point (the tall one) and a horizontal offset term to supply a
-direct position gradient. Those three are functions of the reduced-order state
-alone: none of them mentions a joint, a foot, or a posture, so the policy is
-free to choose how it balances.
+That is the core of the reward, plus a horizontal offset term to supply a
+direct position gradient and a horizontal centre-of-mass speed term to close
+the one loophole L_p leaves open (the rear legs can be swung to null L_p while
+the body translates underneath). Those three are functions of the reduced-order
+state alone: none of them mentions a joint, a foot, or a posture, so the policy
+is free to choose how it balances.
+
+Note what is *not* costed: vertical centre-of-mass motion. Raising and lowering
+the centre of mass is the authority the paper studies, so charging for it would
+be charging for the mechanism. A height target exists on the class but is
+zero-weighted -- see _reward_com_height.
 
 Two foot terms sit alongside them -- drift and contact -- because the pivot is
 tracked live rather than pinned at reset, so the balance terms deliberately do
@@ -386,6 +392,19 @@ class Go2Stand(Go2):
     def _reward_com_height(self):
         """Two-sided tracking of the centre-of-mass height above the feet.
 
+        Currently zero-weighted and therefore never called -- holding a height
+        does not itself make the pose more stable, which is what the task is
+        for right now. Kept because re-enabling it is a one-line weight
+        change, and because the physics argues it is not urgently needed: for
+        an inverted pendulum the divergence rate is sqrt(m g h / I), and
+        folding the rear legs cuts I faster than h, taking the robot from
+        3.78 rad/s to roughly 5 rad/s. Crouching makes balancing *harder*, so
+        the policy is already paid not to do it by every other term.
+
+        Note cfg.reward_settings.com_height_target stays load-bearing while
+        this is off: _compute_reduced_order_state uses it as the pendulum
+        length in the angular-momentum normalizer.
+
         Replaces both min_base_height and the old rear-leg posture anchor:
         curling the rear legs draws the centre of mass down, so extension is
         paid for directly rather than through a joint-space target.
@@ -400,6 +419,33 @@ class Go2Stand(Go2):
             self.com_height.squeeze(1) - self.cfg.reward_settings.com_height_target
         ) / self.cfg.reward_settings.com_height_tolerance
         return self._sqrdexp(error) - 0.2 * error.abs().clamp(max=3.0)
+
+    def _reward_com_vel_xy(self):
+        """Penalize horizontal centre-of-mass speed, leaving vertical free.
+
+        The split is the reduced-order model's own: vertical motion is the
+        control authority the paper is about -- the robot raises and lowers
+        its centre of mass to arrest a lean -- while horizontal motion is the
+        divergent coordinate, and sustained horizontal travel means the robot
+        is relocating rather than balancing.
+
+        Not redundant with _reward_balance_momentum, which is the point.
+        Angular momentum about the pivot can be driven to zero by swinging the
+        rear legs against the trunk, which leaves the body free to translate
+        underneath with L_p still reading ~0. That is the flywheel loophole,
+        and this closes it. Nor is it redundant with _reward_front_feet_drift:
+        drift is an accumulated displacement, this is a rate, so it fires at
+        the start of a lunge rather than after it has finished.
+
+        Isotropic, unlike the two balance terms. Stepping is equally wrong in
+        any direction, and the directional part of the task is already carried
+        by the anisotropic offset and momentum tolerances.
+        """
+        error = (
+            torch.norm(self.com_vel[:, :2], dim=1)
+            / self.cfg.reward_settings.com_vel_tolerance
+        )
+        return self._shaped(error)
 
     def _reward_front_feet_drift(self):
         """Displacement of each support foot from where it was planted.
