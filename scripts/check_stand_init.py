@@ -54,25 +54,46 @@ def main(argv=None):
     )
 
     target_height = env_cfg.reward_settings.base_height_target
+    target_com_height = env_cfg.reward_settings.com_height_target
     target_gravity = torch.tensor(
         env_cfg.reward_settings.target_projected_gravity, device=env.device
     )
     print(f"\ntarget base height   {target_height:.3f} m")
+    print(f"target CoM height    {target_com_height:.3f} m  (above the support anchor)")
     print(f"target proj. gravity {target_gravity.tolist()}")
-    print(f"\n{'t [s]':>7} {'height [m]':>18} {'attitude err [rad]':>20} {'alive':>7}")
+    print(
+        f"\n{'t [s]':>7} {'base h [m]':>12} {'CoM h [m]':>12} "
+        f"{'CoM off [m]':>12} {'|L_xy| [-]':>12} {'|L_z| [-]':>11} "
+        f"{'att err':>10} {'alive':>7}"
+    )
 
     steps = int(args.seconds / env.dt)
     report_every = max(1, steps // 12)
     with torch.no_grad():
         for step in range(steps + 1):
-            height = env.base_height.squeeze(1)
             attitude = torch.norm(env.projected_gravity - target_gravity, dim=1)
             alive = (~env.terminated).float().mean().item()
             if step % report_every == 0:
+                # The reduced-order state the rewards are built from. At step 0
+                # the offset and the momentum must both read ~0 -- that is the
+                # check that the support anchor and frame are right, not just
+                # that the posture is. Under zero actions the momentum should
+                # then grow monotonically as the robot tips.
+                offset = torch.norm(env.com_offset, dim=1)
+                momentum = torch.norm(env.support_momentum[:, :2], dim=1)
+                # Yaw is uncosted by every reward -- gravity exerts no torque
+                # about the vertical, so it is outside the reduced-order model
+                # and projected_gravity cannot see a spin either. Logged so a
+                # run tells us whether exploration finds it.
+                yaw_momentum = env.support_momentum[:, 2].abs()
                 print(
                     f"{step * env.dt:7.2f} "
-                    f"{height.mean().item():9.3f} +/- {height.std().item():.3f} "
-                    f"{attitude.mean().item():12.3f} +/- {attitude.std().item():.3f} "
+                    f"{env.base_height.squeeze(1).mean().item():12.4f} "
+                    f"{env.com_height.squeeze(1).mean().item():12.4f} "
+                    f"{offset.mean().item():12.4f} "
+                    f"{momentum.mean().item():12.4f} "
+                    f"{yaw_momentum.mean().item():11.4f} "
+                    f"{attitude.mean().item():10.3f} "
                     f"{alive:7.0%}"
                 )
             if step == steps:
@@ -82,8 +103,12 @@ def main(argv=None):
             env.step()
 
     print(
-        f"\nstep 0 is the initialization check: height should read "
-        f"{target_height:.3f} m and attitude error ~0."
+        f"\nstep 0 is the initialization check: base height should read "
+        f"{target_height:.3f} m, attitude error ~0, and both the CoM offset "
+        f"and |L_xy| ~0."
+        f"\nThe CoM height at step 0 is the measurement that "
+        f"reward_settings.com_height_target should be set from "
+        f"(currently {target_com_height:.3f} m)."
     )
 
 
