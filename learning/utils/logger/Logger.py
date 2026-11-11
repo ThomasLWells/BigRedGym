@@ -1,6 +1,7 @@
 import json
 import os
 
+import numpy as np
 import wandb
 
 from .EpisodicLogs import EpisodicLogs
@@ -190,12 +191,23 @@ class Logger:
         )
         if filled == 0:
             return {}
-        return {
-            f"rewards_hist/{key}": wandb.Histogram(
-                buffer[:filled].detach().cpu().numpy()
-            )
-            for key, buffer in self.reward_logs.finished_episodes.items()
-        }
+        histograms = {}
+        for key, buffer in self.reward_logs.finished_episodes.items():
+            # float64 before binning, because numpy chooses the bin dtype from
+            # the input. A term that is near-constant across episodes -- a
+            # constant reward averages to its weight every time, differing
+            # only by float32 accumulation noise of about one ulp -- spans a
+            # range that 64 float32 bin edges cannot divide, and np.histogram
+            # raises instead of coping. Exactly-equal samples are fine, numpy
+            # widens those by +/-0.5; it is the nearly-equal case that breaks.
+            samples = buffer[:filled].detach().cpu().numpy().astype(np.float64)
+            # A NaN reward is worth finding out about, but not by killing a
+            # GPU run inside the logger. Drop the histogram and let the scalar
+            # average carry the NaN into wandb where it is visible.
+            if not np.isfinite(samples).all():
+                continue
+            histograms[f"rewards_hist/{key}"] = wandb.Histogram(samples)
+        return histograms
 
     def log_to_wandb(self):
         def prepend_to_keys(prefix, dictionary):

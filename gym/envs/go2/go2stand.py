@@ -16,6 +16,13 @@ Therefore L_p held at zero means the centre of mass is over the contact line,
 which is the definition of balanced. One scalar subsumes lean angle, lean rate,
 and "am I about to fall".
 
+The identity is exact only for a stationary p, and p is tracked live here, so
+a sliding foot adds an unmodelled -m * pdot x cdot. That is a deliberate
+trade: pinning p would keep the identity exact but make the reward *wrong*
+after any drift, pointing the robot away from the support it is actually
+standing on. Keeping p live and charging for drift separately
+(_reward_front_feet_drift) bounds pdot instead, which bounds the error term.
+
 That is the core of the reward, plus a loose centre-of-mass height target to
 pick which fixed point (the tall one) and a horizontal offset term to supply a
 direct position gradient. Those three are functions of the reduced-order state
