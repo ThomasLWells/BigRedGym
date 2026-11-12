@@ -213,6 +213,7 @@ def test_every_reward_peaks_at_exactly_one_at_the_goal():
         task._reward_com_height,
         task._reward_com_vel_xy,
         task._reward_front_feet_drift,
+        task._reward_balance_yaw,
         task._reward_balance_alive,
     ):
         assert reward().item() == pytest.approx(1.0)
@@ -263,8 +264,10 @@ def test_foot_drift_reports_the_worst_foot_not_the_average():
     assert one_foot_moved.item() < both_still.item()
 
     # The mean would be 0.03 and score distinctly better than the max of 0.06.
+    # Note the logarithmic tail, not _shaped's clamped linear one.
     tolerance = Go2StandCfg.reward_settings.foot_drift_tolerance
-    expected = math.exp(-4 * (0.06 / tolerance) ** 2) - 0.2 * (0.06 / tolerance)
+    error = 0.06 / tolerance
+    expected = math.exp(-4 * error**2) - 0.2 * math.log1p(error)
     assert one_foot_moved.item() == pytest.approx(expected, rel=1e-5)
 
 
@@ -306,12 +309,66 @@ def test_height_reward_is_two_sided():
     assert short.item() < 1.0
 
 
-def test_yaw_momentum_is_deliberately_uncosted():
-    """Gravity exerts no torque about the vertical, so yaw is outside the
-    model. Documented as a known gap: a slowly spinning handstand scores
-    full marks."""
-    spinning = _reward_task(momentum=(0.0, 0.0, 5.0))
+def test_yaw_is_costed_by_its_own_term_and_cannot_swamp_the_balance_signal():
+    """Yaw was uncosted and a policy duly pivoted about one foot.
+
+    It is costed now, but as a separate term rather than a third component of
+    balance_momentum's norm. That separation is the point: the gradient of a
+    norm splits as v_i/||v||, and yaw momentum is excited so much more easily
+    than pitch (I_zz = 0.136 vs I_yy = 6.48 kg m^2) that it reaches 97% of a
+    combined norm within 0.1 s of exploration -- leaving the balance signal
+    with almost none of its own gradient.
+    """
+    spinning = _reward_task(momentum=(0.0, 0.0, 0.01))
+    assert spinning._reward_balance_yaw().item() < 1.0, "yaw must not be free"
+
+    # ...and it must leave balance_momentum completely alone.
     assert spinning._reward_balance_momentum().item() == pytest.approx(1.0)
+
+    # Symmetric: spinning either way costs the same.
+    widdershins = _reward_task(momentum=(0.0, 0.0, -0.01))._reward_balance_yaw()
+    assert spinning._reward_balance_yaw().item() == pytest.approx(
+        widdershins.item(), rel=1e-5
+    )
+
+
+def test_yaw_tolerance_is_not_saturated_by_exploration_noise():
+    """The front_feet_drift lesson, applied before it bites again.
+
+    A term pinned at its clamp is constant, and a constant is invisible to
+    PPO at any weight. Yaw momentum measured under exploration-scale random
+    actions peaks at |L_z|/N = 0.0129, which must stay clear of the e = 3
+    clamp or the term is inert from the first iteration.
+    """
+    measured_exploration_peak = 0.0129
+    tolerance = Go2StandCfg.reward_settings.yaw_momentum_tolerance
+    assert measured_exploration_peak / tolerance < 3.0
+
+    # And it must still be meaningfully negative there, not merely unclamped.
+    hot = _reward_task(momentum=(0.0, 0.0, measured_exploration_peak))
+    assert hot._reward_balance_yaw().item() < -0.2
+
+
+def test_drift_keeps_pushing_back_far_past_the_old_clamp():
+    """The regression test for the bug this term shipped with.
+
+    _shaped clamps its linear tail at e = 3, so with a 0.05 m tolerance the
+    drift term was exactly constant beyond 0.15 m. Drift accumulates
+    monotonically against a reset-planted anchor, so it crossed that in ~0.5 s
+    and spent 94-96% of every episode at a flat -0.6. A constant is invisible
+    to PPO -- GAE cancels it and advantages are variance-normalized -- so
+    raising the weight tenfold changed nothing measurable.
+
+    Under the old code every assertion below is an equality.
+    """
+    scores = [
+        _reward_task(drift=d)._reward_front_feet_drift().item() for d in (0.3, 0.5, 1.0)
+    ]
+    assert scores[0] > scores[1] > scores[2], "gradient must survive past 3 tolerances"
+
+    # And the push is still real, not a rounding artefact.
+    assert scores[0] - scores[1] > 0.05
+    assert scores[1] - scores[2] > 0.1
 
 
 def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
@@ -324,7 +381,7 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     far = _reward_task(
         offset=(100.0, 0.0),
         height=-100.0,
-        momentum=(100.0, 0.0, 0.0),
+        momentum=(100.0, 0.0, 100.0),
         drift=100.0,
         com_vel=(100.0, 0.0, 0.0),
     )
@@ -334,22 +391,27 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
         far._reward_balance_offset,
         far._reward_com_height,
         far._reward_com_vel_xy,
-        far._reward_front_feet_drift,
+        far._reward_balance_yaw,
     ):
         assert reward().item() == pytest.approx(floor, abs=1e-6)
 
-    # The alive bonus must outweigh every shaped floor at once, or the
-    # per-step total goes negative and terminating becomes the cheaper
-    # option. front_feet_support is a smoothstep in [0, 1] and cannot go
-    # negative, so it does not enter.
+    # Drift is on the logarithmic tail, so it bottoms out lower and only at
+    # its own guard of e = 40 (2 m of drift).
+    drift_floor = math.exp(-4 * 40.0**2) - 0.2 * math.log1p(40.0)
+    assert far._reward_front_feet_drift().item() == pytest.approx(drift_floor, abs=1e-6)
+
+    # The alive bonus must outweigh every floor at once, or the per-step
+    # total goes negative and terminating becomes the cheaper option.
+    # front_feet_support is a smoothstep in [0, 1] and cannot go negative, so
+    # it does not enter. Summed from the config rather than hardcoded, so
+    # adding a term or retuning a weight fails here rather than in a GPU run.
     weights = Go2StandRunnerCfg().critic.reward.weights
-    shaped = (
-        weights.balance_momentum
-        + weights.balance_offset
-        + weights.com_vel_xy
-        + weights.front_feet_drift
+    clamped = sum(
+        getattr(weights, name)
+        for name in ("balance_momentum", "balance_offset", "com_vel_xy", "balance_yaw")
     )
-    assert weights.balance_alive + floor * shaped > 0.0
+    worst = clamped * floor + weights.front_feet_drift * drift_floor
+    assert weights.balance_alive + worst > 0.0
     # com_height is off: an absent key, not a zero, because this weights class
     # does not inherit. If it is ever re-enabled it joins the sum above.
     assert not hasattr(weights, "com_height")

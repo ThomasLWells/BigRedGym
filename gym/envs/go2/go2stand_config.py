@@ -192,7 +192,10 @@ class Go2StandCfg(Go2Cfg):
         # two-thirds. y puts the polygon edge at e = 0.95.
         support_offset_tolerance = [0.06, 0.15]
         # Metres a support foot may slide from where it was planted, per error
-        # unit. 2 cm scores 0.45, 5 cm scores -0.18, 15 cm bottoms out.
+        # unit. Against the logarithmic tail (_shaped_log_tail, not _shaped):
+        # 2 cm scores 0.46, 10 cm scores -0.22, 50 cm scores -0.48 and is
+        # still pushing back at -0.36 per metre, where the old clamped tail
+        # was flat from 15 cm onward.
         foot_drift_tolerance = 0.05
         # Metres per second of HORIZONTAL centre-of-mass speed per error unit.
         # Vertical speed is deliberately uncosted -- raising and lowering the
@@ -226,16 +229,31 @@ class Go2StandCfg(Go2Cfg):
         # for a reward whose point is to let the policy find the flywheel.
         #
         # Per axis of the support frame, and note this is the OPPOSITE
-        # assignment to support_offset_tolerance: [about x, about y]. Momentum
-        # about y is pitch about the contact line -- the underactuated mode,
-        # hence tight. Momentum about x is roll, which the foot separation
-        # arrests, hence loose. A displacement along x is dangerous; a
-        # rotation about x is not.
+        # assignment to support_offset_tolerance: [about x, about y, about z].
+        # Momentum about y is pitch about the contact line -- the
+        # underactuated mode, hence tight. Momentum about x is roll, which the
+        # foot separation arrests, hence loose. A displacement along x is
+        # dangerous; a rotation about x is not.
         #
         # All of these are against _sqrdexp = exp(-4 e^2): tracking_sigma is
         # 0.25, so the reward reaches 0.37 at e = 0.5, not e = 1. Halving a
         # tolerance here is a much bigger change than it looks.
         angular_momentum_tolerance = [0.25, 0.15]
+        # Yaw gets its own tolerance AND its own reward term, deliberately --
+        # see Go2Stand._reward_balance_yaw. Measured under exploration-scale
+        # actions, yaw momentum is 97% of the combined norm within 0.1 s, so
+        # folding it in would have handed it almost all of the balance
+        # signal's gradient.
+        #
+        # 0.0075 is set so the term stays OFF its clamp in the regime the
+        # policy actually occupies -- the mistake that made front_feet_drift
+        # inert. Measured |L_z|/N: 0.0006 at reset (e = 0.08), 0.0129 under
+        # random actions (e = 1.72, still short of the e = 3 clamp). A
+        # deliberate 0.3 rad/s pivot costs e = 0.24, 1 rad/s costs e = 0.80.
+        # Tighten toward 0.004 if pivoting survives, but re-measure the
+        # exploration figure first -- below ~0.0043 random actions alone
+        # saturate it and the weight stops meaning anything.
+        yaw_momentum_tolerance = 0.0075
 
     class scaling(Go2Cfg.scaling):
         # Normalize the observed height by the goal, so the critic sees ~1.0
@@ -334,16 +352,34 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # the balance signal rather than by pricing it. Support also
                 # keeps the model's own precondition true: in free flight the
                 # reduced-order model does not apply at all.
-                front_feet_drift = 20.0
+                front_feet_drift = 2.0
                 front_feet_support = 1.5
+                # Yaw, separate from balance_momentum so it cannot swamp the
+                # pitch gradient -- see Go2Stand._reward_balance_yaw.
+                balance_yaw = 1.0
                 # Not a shaping term -- a constant that keeps the per-step
-                # total strictly positive. The four shaped terms bottom out at
-                # -4.8 weighted, and at the measured termination boundary they
-                # sum to about -4.45. Without this, riding a fall down costs
-                # more per step than terminating does (-1e-4), so the only
-                # gradient available to an untrained policy points at falling
-                # faster. Goal total is 15.0, brink total about 1.05.
-                balance_alive = 5.5
+                # total strictly positive. Without it, riding a fall down
+                # costs more per step than terminating does (-1e-4), so the
+                # only gradient available to an untrained policy points at
+                # falling faster.
+                #
+                # Every _shaped term floors at -0.6 and front_feet_drift, on
+                # the logarithmic tail, floors at -0.743, so the constraint is
+                #
+                #     balance_alive >= 0.6 * (balance_momentum + balance_offset
+                #                             + com_vel_xy + balance_yaw)
+                #                      + 0.743 * front_feet_drift
+                #
+                # Here 0.6 * 7 + 0.743 * 2 = 5.686, against 6.0 -> worst case
+                # +0.31. (front_feet_support is a smoothstep in [0, 1] and
+                # cannot go negative, so it never enters.)
+                #
+                # RAISE THIS IF YOU RAISE ANY OF THOSE WEIGHTS -- there is a
+                # test asserting the inequality. The Nov12 run set drift to
+                # 20.0 and left this at 5.5, which put the worst case at
+                # -10.1/step and produced 186 consecutive iterations of
+                # negative total reward.
+                balance_alive = 6.0
 
             class termination_weight:
                 # The terminal reward is -weight * dt, so this is tiny by

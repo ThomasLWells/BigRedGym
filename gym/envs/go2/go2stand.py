@@ -334,15 +334,45 @@ class Go2Stand(Go2):
         """
         return self._sqrdexp(error) - 0.2 * error.clamp(max=3.0)
 
+    def _shaped_log_tail(self, error):
+        """Squared exponential with a tail that never goes flat.
+
+        _shaped's clamp is right for the balance terms: a falling robot
+        terminates, so it cannot park in the saturated region for long. It is
+        fatal for anything that accumulates monotonically *within* an episode.
+        Foot drift crossed three tolerances in about 0.5 s and then sat at a
+        constant -0.6 for 94-96% of every rollout, and a constant is invisible
+        to PPO at any weight -- GAE cancels it once the critic adapts, and
+        advantages are variance-normalized on top of that. Raising the drift
+        weight from 2.0 to 20.0 changed nothing at all: both runs converged to
+        an unweighted term of -0.533 +/- 0.001.
+
+        log1p keeps the far field bounded in practice while never zeroing the
+        gradient, which is -0.2/(1+e). Note this is *weaker* than the clamped
+        tail in the near field (-1.33 vs -4.00 per metre at 0.10 m of drift);
+        the point is not a bigger push but a push that survives, so that the
+        weight is a working knob again.
+
+        The clamp at e = 40 is a floor guard at 2 m of drift, not a shaping
+        choice -- com_vel_xy dominates long before that. It bounds the term at
+        -0.743, which is what the strict-positivity sum in
+        _reward_balance_alive is computed against.
+        """
+        return self._sqrdexp(error) - 0.2 * torch.log1p(error.clamp(max=40.0))
+
     def _reward_balance_alive(self):
         """Constant, and the only term that is not about the pendulum.
 
         Sized so the per-step total stays strictly positive everywhere in the
-        reachable state space: the four shaped terms bottom out at
-        -0.6 * (3 + 2 + 1 + 2) = -4.8 weighted, against this term's 5.5
-        (front_feet_support is a smoothstep in [0, 1] and cannot go negative).
-        At the measured termination boundary they sum to about -4.45, so
-        surviving scores +1.05 against -1e-4 for terminating.
+        reachable state space. The four _shaped terms bottom out at
+        -0.6 * (3 + 2 + 1 + 1) = -4.2 weighted and front_feet_drift, on the
+        logarithmic tail, bottoms at -0.743 * 2.0 = -1.49, for a floor of
+        -5.69 against this term's 6.0 (front_feet_support is a smoothstep in
+        [0, 1] and cannot go negative). The constraint to preserve when
+        retuning is
+
+            balance_alive >= 0.6 * sum(clamped term weights)
+                             + 0.743 * front_feet_drift
 
         It says nothing about *how* to balance, so it does not re-specify the
         solution the way the twelve terms it replaces did.
@@ -352,18 +382,44 @@ class Go2Stand(Go2):
     def _reward_balance_momentum(self):
         """Angular momentum about the support anchor -> 0. The balance signal.
 
-        Horizontal components only, and with per-axis tolerances. Momentum
-        about y -- the contact line -- is the exact reduced-order coordinate
-        and the underactuated mode, so it gets the tight tolerance. Momentum
-        about x is roll, which the 0.284 m foot separation actually arrests,
-        so it gets a looser one. Note this is the opposite assignment to
+        All three axes, with per-axis tolerances. Momentum about y -- the
+        contact line -- is the exact reduced-order coordinate and the
+        underactuated mode, so it gets the tight tolerance. Momentum about x
+        is roll, which the 0.284 m foot separation actually arrests, so it
+        gets a looser one. Note this is the opposite assignment to
         _reward_balance_offset; see _init_buffers.
 
-        Yaw is left uncosted -- gravity exerts no torque about the vertical,
-        so it is outside the model entirely.
+        Horizontal components only. Yaw is costed too, but by
+        _reward_balance_yaw rather than by joining this norm -- see there for
+        why that separation is load-bearing.
         """
         error = torch.norm(
             self.support_momentum[:, :2] / self._momentum_tolerance, dim=1
+        )
+        return self._shaped(error)
+
+    def _reward_balance_yaw(self):
+        """Angular momentum about the vertical -> 0.
+
+        Yaw was uncosted and a policy duly found the free degree of freedom
+        and started pivoting about one foot. Nothing else could see it:
+        gravity exerts no torque about the vertical so it is outside the
+        reduced-order model, and projected_gravity is yaw-invariant so even
+        the attitude termination is blind to a spin.
+
+        A separate term, not a third component of _reward_balance_momentum's
+        norm, and that is not cosmetic. The gradient of a norm splits between
+        its components as v_i/||v||, so the largest component owns it.
+        Measured under exploration-scale actions, yaw momentum reaches 97% of
+        the combined norm within 0.1 s and holds 72-76% through a fall -- it
+        is excited far more easily than pitch because I_zz about the contact
+        line is 0.136 kg m^2 against I_yy = 6.48. Folded into one norm it
+        would leave the actual balance signal with 3-25% of its own gradient.
+        Split out, each keeps its own.
+        """
+        error = (
+            self.support_momentum[:, 2].abs()
+            / self.cfg.reward_settings.yaw_momentum_tolerance
         )
         return self._shaped(error)
 
@@ -475,7 +531,11 @@ class Go2Stand(Go2):
             torch.amax(torch.norm(drift, dim=-1), dim=1)
             / self.cfg.reward_settings.foot_drift_tolerance
         )
-        return self._shaped(error)
+        # The one term that uses the logarithmic tail. Drift is the only
+        # quantity here that accumulates monotonically within an episode and
+        # therefore reaches _shaped's clamp with certainty rather than only
+        # while falling -- see _shaped_log_tail.
+        return self._shaped_log_tail(error)
 
     def _reward_front_feet_support(self):
         """Both support feet loaded at once.
