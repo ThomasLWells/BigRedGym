@@ -334,7 +334,7 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # the balance signal rather than by pricing it. Support also
                 # keeps the model's own precondition true: in free flight the
                 # reduced-order model does not apply at all.
-                front_feet_drift = 2.0
+                front_feet_drift = 20.0
                 front_feet_support = 1.5
                 # Not a shaping term -- a constant that keeps the per-step
                 # total strictly positive. The four shaped terms bottom out at
