@@ -10,40 +10,33 @@ from gym.envs.go2.go2_config import Go2Cfg, Go2RunnerCfg
 # other in x. Residual CoM offset 0.13 mm (0.02 Nm), against 29.4 Nm for a
 # naive bent-leg posture.
 #
-# Note the knee can never straighten: the calf range is [-2.723, -0.838], so
-# it carries at least 48 degrees of bend no matter what. A perfectly straight
-# leg is kinematically unreachable; -0.85 is the straightest usable value,
-# keeping 0.012 rad off the limit. The thigh is also offset 0.0955 m laterally
-# from the hip, so a leg axis exactly parallel to the trunk is impossible
-# either -- the rear pair sits 13.8 degrees off, which is its minimum.
+# The knee can never straighten: the calf range is [-2.723, -0.838], so it
+# carries at least 48 degrees of bend no matter what, and -0.85 is the
+# straightest usable value, 0.012 rad off the limit. The thigh is also offset
+# 0.0955 m laterally from the hip, so a leg axis exactly parallel to the trunk
+# is impossible -- the rear pair sits 13.8 degrees off, its minimum.
 #
-# The equilibrium is balance-on-a-line, not a stable basin: the support
-# polygon is the segment between the two front feet, so the pose is an
-# inverted pendulum in pitch. Holding it is an active task -- a joint-space PD
-# at this posture produces zero torque and the robot falls in under a second,
-# at any stiffness (tested 30 to 250; above 60 the calf saturates its 45.4 Nm
-# limit and higher gains are worse).
+# The equilibrium is balance-on-a-line, not a stable basin: the support polygon
+# is the segment between the two front feet, so the pose is an inverted
+# pendulum in pitch. Holding it is an active task -- a joint-space PD at this
+# posture produces zero torque and the robot falls in under a second, at any
+# stiffness (tested 30 to 250; above 60 the calf saturates its 45.4 Nm limit
+# and higher gains are worse).
 HANDSTAND_HEIGHT = 0.6035
 TARGET_PROJECTED_GRAVITY = [1.0, 0.0, 0.0]
 
-# Height of the whole-body centre of mass above the front-foot contact point,
-# which is the pendulum length the reduced-order reward is built on. MEASURED
-# with scripts/check_stand_init.py, not derived -- reusing a constant that was
-# chosen for something else is exactly how an earlier version of this task
-# ended up with a reward that was flat across its whole operating range.
+# Height of the whole-body centre of mass above the front-foot contact point:
+# the pendulum length the reduced-order reward is built on.
 #
-# The hand computation from the URDF predicted 0.562 m; the model measures
-# 0.5806 m at the nominal pose and 0.5793 +/- 0.001 over the reset
-# distribution. The 18 mm gap is the rotor and calf-shell bodies, which carry
-# 1.07 kg that the hand computation placed at the joint axes -- they sit in
-# the rear legs at z ~ 0.95 as much as the front, so they pull the centre of
-# mass up. The measurement is the authority; the prediction is kept only
-# because agreeing to 18 mm is what established that the support anchor and
-# frame are correct rather than the constant being fitted to them.
+# MEASURED with scripts/check_stand_init.py -- 0.5806 m at the nominal pose,
+# 0.5793 +/- 0.001 over the reset distribution. Re-measure rather than re-derive
+# if the posture or the URDF changes; a hand computation from link inertials
+# lands 18 mm low, because the rotor and calf-shell bodies carry 1.07 kg that
+# sits high in the raised rear legs.
 #
-# Note this is the *origin-proxy* centre of mass -- see Go2Stand's docstring.
-# It reads 8.9 mm higher than the true one, which is why this number belongs
-# with the reward that uses the same proxy and must not be reused elsewhere.
+# This is the *origin-proxy* centre of mass (see Go2Stand's docstring), which
+# reads 8.9 mm above the true one. It belongs with the rewards that use the
+# same proxy and must not be reused elsewhere.
 HANDSTAND_COM_HEIGHT = 0.5806
 
 # Front legs reach "down" and rear legs "up" along the trunk axis. The calf is
@@ -61,10 +54,9 @@ CALF_JITTER = 0.03
 
 class Go2StandCfg(Go2Cfg):
     class env(Go2Cfg.env):
-        # A hold, not a stride. Raised from 6 s because the first stage-1 run
-        # saturated at 5.991 s of a 6 s cap, leaving no headroom to tell "just
-        # barely holds" from "rock solid". Note the cap alone does not make the
-        # policy value longer holds -- see algorithm.discount_horizon.
+        # A hold, not a stride, and long enough to tell "just barely holds"
+        # from "rock solid". The cap alone does not make the policy value a
+        # longer hold -- see algorithm.discount_horizon.
         episode_length_s = 10
 
     class init_state(Go2Cfg.init_state):
@@ -139,17 +131,16 @@ class Go2StandCfg(Go2Cfg):
         }
 
     class control(Go2Cfg.control):
-        # Two legs carry the whole 16.3 kg (160 N) inverted, where four shared
-        # it before, so the stance gains are raised from Go2's 20/0.5. Expect
-        # to tune these: the calf torque limit is 45.4 Nm.
+        # Two legs carry the whole 16.3 kg (160 N) inverted, so the stance
+        # gains are raised above Go2's 20/0.5. Expect to tune these: the calf
+        # torque limit is 45.4 Nm.
         stiffness = {"hip": 30.0, "thigh": 30.0, "calf": 30.0}
         damping = {"hip": 1.0, "thigh": 1.0, "calf": 1.0}
 
     class domain_randomization(Go2Cfg.domain_randomization):
         class startup(Go2Cfg.domain_randomization.startup):
             # A handstand lives or dies on the front feet not slipping, so the
-            # friction floor is raised from Go2's 0.5 for stage 0. Widen it
-            # again once the pose holds.
+            # friction floor is high for stage 0. Widen it once the pose holds.
             contact_friction_range = [0.8, 1.0]
             link_mass_scale_range = [0.95, 1.05]
 
@@ -157,102 +148,94 @@ class Go2StandCfg(Go2Cfg):
         # Radians of attitude error past which the fall is unrecoverable. The
         # zero-action trace crosses 0.3 rad while still roughly upright and
         # reaches 1.414 rad lying flat, so 0.6 ends the episode without cutting
-        # off recovery attempts. This is a sample-efficiency gate: no reward
-        # term mentions attitude, so without it most of the rollout would be
-        # spent collecting samples from a robot that is already down.
+        # off recovery attempts. A sample-efficiency gate: no reward term
+        # mentions attitude, so without it most of the rollout would be spent
+        # collecting samples from a robot that is already down.
         max_attitude_error = 0.6
 
     class reward_settings(Go2Cfg.reward_settings):
-        # Not used by any reward any more -- the height target moved to the
-        # centre of mass. Kept because scripts/check_stand_init.py reports
-        # against it and it documents the solved pose.
+        # Read by scripts/check_stand_init.py and by the termination check; no
+        # reward uses base_height_target, the height target being on the centre
+        # of mass instead.
         base_height_target = HANDSTAND_HEIGHT
         target_projected_gravity = TARGET_PROJECTED_GRAVITY
 
+        # Load-bearing even though _reward_com_height is zero-weighted: it is
+        # the pendulum length in the angular-momentum normalizer.
         com_height_target = HANDSTAND_COM_HEIGHT
-        # Three times looser than the 0.04 base-height tracker this replaces,
-        # because varying centre-of-mass height is the control authority the
-        # reduced-order model is *about*. 3 cm scores 0.73, 6 cm scores 0.27,
-        # and folding the legs to 0.30 m bottoms the term out. Not looser than
-        # this: the available height range is only ~0.28 m, so the term has to
-        # resolve inside it.
+        # Loose, because varying centre-of-mass height is the control authority
+        # the reduced-order model is about. 3 cm scores 0.73, 6 cm scores 0.27,
+        # folding the legs to 0.30 m bottoms the term out. Not looser than
+        # this: the available height range is only ~0.28 m.
         com_height_tolerance = 0.12
         # Metres of horizontal centre-of-mass offset per error unit, per axis
         # of the support frame: [perpendicular to the contact line, along it].
         #
         # Anisotropic because the support is a 0.284 m segment, not a disc.
-        # Offset along x leaves the contact line, where there is no support
-        # polygon at all; offset along y stays inside the 0.142 m half-width.
+        # Offset along x crosses the contact line, where there is no support
+        # polygon at all; along y it stays inside the 0.142 m half-width.
         # Charging them equally would price a harmless 3 cm roll offset the
         # same as a 3 cm lean onto the knife edge.
         #
-        # x is sized to be commensurate with angular_momentum_tolerance rather
-        # than picked independently -- see _reward_balance_offset for the
-        # capture-point arithmetic that lands on 0.094 m, of which 0.06 is
-        # two-thirds. y puts the polygon edge at e = 0.95.
+        # x is commensurate with angular_momentum_tolerance rather than chosen
+        # independently -- see _reward_balance_offset for the capture-point
+        # arithmetic that lands on 0.094 m, of which 0.06 is two-thirds. y puts
+        # the polygon edge at e = 0.95.
         support_offset_tolerance = [0.06, 0.15]
         # Metres a support foot may slide from where it was planted, per error
         # unit. Against the logarithmic tail (_shaped_log_tail, not _shaped):
-        # 2 cm scores 0.46, 10 cm scores -0.22, 50 cm scores -0.48 and is
-        # still pushing back at -0.36 per metre, where the old clamped tail
-        # was flat from 15 cm onward.
+        # 2 cm scores 0.46, 10 cm scores -0.22, and 50 cm scores -0.48 while
+        # still pushing back at -0.36 per metre.
         foot_drift_tolerance = 0.05
         # Metres per second of HORIZONTAL centre-of-mass speed per error unit.
-        # Vertical speed is deliberately uncosted -- raising and lowering the
-        # centre of mass is the control authority the reduced-order model is
-        # about, and at reset the vertical component (0.066 m/s) is already
-        # larger than the horizontal one.
+        # Vertical speed is uncosted -- raising and lowering the centre of mass
+        # is the control authority, and at reset the vertical component
+        # (0.066 m/s) is already larger than the horizontal one.
         #
-        # Measured, over 256 envs: horizontal speed is 0.037 m/s at reset
+        # Measured over 256 envs: horizontal speed is 0.037 m/s at reset
         # (p95 0.060), 0.088 while the pose settles under zero actions, and
         # 0.66-0.89 at the termination boundary. At 0.25 the reset draw -- an
         # initial condition the policy does not control -- scores 0.885, the
         # settling transient 0.54, a 0.3 m/s translation -0.24, and a fall
-        # bottoms out. Resolution is deliberately concentrated at the low end,
-        # since that is where this term says something balance_momentum does
-        # not; in a real fall the two saturate together.
+        # bottoms out. Resolution is concentrated at the low end, since that is
+        # where this term says something balance_momentum does not; in a real
+        # fall the two saturate together.
         com_vel_tolerance = 0.25
         # In units of m*h*sqrt(g*h) = 22.6 kg m^2/s, the momentum of the whole
-        # robot tipping at the pendulum's natural rate. Measured anchors, not
-        # estimated ones: whole-body inertia about the contact line is
-        # 6.48 kg m^2 (not m*h^2 -- the rear legs are 4.7 kg out at 0.93 m and
-        # dominate the second moment), the reset distribution sits at
-        # 0.0165 +/- 0.009, and a free fall at the 0.6 rad termination
-        # boundary reaches 2.26 rad/s = 0.649 normalized.
+        # robot tipping at the pendulum's natural rate. Per axis of the support
+        # frame, and note this is the OPPOSITE assignment to
+        # support_offset_tolerance: [about x, about y]. Momentum about y is
+        # pitch about the contact line, the underactuated mode, hence tight;
+        # about x is roll, which the foot separation arrests, hence loose. A
+        # displacement along x is dangerous; a rotation about x is not.
         #
-        # At 0.15: the reset state scores 0.93, so an untrained policy starts
-        # near the ceiling and has something to protect; 0.3 rad/s of tipping
-        # scores 0.15; the termination boundary is clamped at -0.6. It is also
-        # about 1.3x the rear-leg flywheel's authority (swinging the pair out
-        # at 10 rad/s is dL ~ 2.6, i.e. 0.115 normalized), so one tolerance is
-        # roughly one swing's worth of cancellable momentum -- the right scale
-        # for a reward whose point is to let the policy find the flywheel.
-        #
-        # Per axis of the support frame, and note this is the OPPOSITE
-        # assignment to support_offset_tolerance: [about x, about y, about z].
-        # Momentum about y is pitch about the contact line -- the
-        # underactuated mode, hence tight. Momentum about x is roll, which the
-        # foot separation arrests, hence loose. A displacement along x is
-        # dangerous; a rotation about x is not.
+        # Anchored on measurements: whole-body inertia about the contact line
+        # is 6.48 kg m^2 (not m*h^2 -- the rear legs are 4.7 kg out at 0.93 m
+        # and dominate the second moment), the reset distribution sits at
+        # 0.0165 +/- 0.009, and a free fall at the 0.6 rad termination boundary
+        # reaches 2.26 rad/s = 0.649 normalized. At 0.15 the reset state scores
+        # 0.93, so an untrained policy starts near the ceiling with something
+        # to protect; 0.3 rad/s of tipping scores 0.15; the boundary clamps at
+        # -0.6. It is also about 1.3x the rear-leg flywheel's authority
+        # (swinging the pair at 10 rad/s is dL ~ 2.6, i.e. 0.115 normalized),
+        # so one tolerance is roughly one swing's worth of cancellable
+        # momentum -- the right scale for a reward meant to let the policy find
+        # the flywheel.
         #
         # All of these are against _sqrdexp = exp(-4 e^2): tracking_sigma is
         # 0.25, so the reward reaches 0.37 at e = 0.5, not e = 1. Halving a
         # tolerance here is a much bigger change than it looks.
         angular_momentum_tolerance = [0.25, 0.15]
-        # Yaw gets its own tolerance AND its own reward term, deliberately --
-        # see Go2Stand._reward_balance_yaw. Measured under exploration-scale
-        # actions, yaw momentum is 97% of the combined norm within 0.1 s, so
-        # folding it in would have handed it almost all of the balance
-        # signal's gradient.
+        # Yaw has its own tolerance and its own reward term -- see
+        # Go2Stand._reward_balance_yaw for why it must not join the norm above.
         #
-        # 0.0075 is set so the term stays OFF its clamp in the regime the
-        # policy actually occupies -- the mistake that made front_feet_drift
-        # inert. Measured |L_z|/N: 0.0006 at reset (e = 0.08), 0.0129 under
-        # random actions (e = 1.72, still short of the e = 3 clamp). A
-        # deliberate 0.3 rad/s pivot costs e = 0.24, 1 rad/s costs e = 0.80.
-        # Tighten toward 0.004 if pivoting survives, but re-measure the
-        # exploration figure first -- below ~0.0043 random actions alone
-        # saturate it and the weight stops meaning anything.
+        # 0.0075 keeps the term OFF its clamp in the regime the policy actually
+        # occupies, which is what makes its weight a working knob. Measured
+        # |L_z|/N: 0.0006 at reset (e = 0.08) and 0.0129 under exploration-scale
+        # random actions (e = 1.72, short of the e = 3 clamp). A deliberate
+        # 0.3 rad/s pivot costs e = 0.24, 1 rad/s costs e = 0.80. Tighten
+        # toward 0.004 if pivoting survives, but re-measure the exploration
+        # figure first: below ~0.0043 random actions alone saturate it.
         yaw_momentum_tolerance = 0.0075
 
     class scaling(Go2Cfg.scaling):
@@ -319,43 +302,26 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
 
         class reward:
             class weights:
-                # The three that carry the task are pure functions of the
-                # reduced-order state -- none of them mentions a joint, a foot
-                # or a posture, so the policy is free to choose how it
-                # balances. Every term is a bare scalar with ceiling 1.0, so
-                # the logged per-second average of each approaches its own
-                # weight at the goal and a glance says how close the policy is.
+                # Every term is a bare scalar with ceiling 1.0, so the logged
+                # per-second average of each approaches its own weight at the
+                # goal and a glance says how close the policy is. Goal total
+                # 16.5.
                 #
-                # This replaces 12 hand-tuned weights. Those described pieces
-                # of the solution rather than the goal, and they fought each
-                # other: raising the regularizers 10x once made standing rigid
-                # for 1.2 s score higher (8.53) than balancing for 10 s (7.69).
+                # The first three are pure functions of the reduced-order
+                # state and name no joint, foot or posture, so the policy
+                # chooses how it balances.
                 balance_momentum = 3.0
                 balance_offset = 2.0
-                # Horizontal centre-of-mass speed only. Took com_height's
-                # weight in a straight 1-for-1 swap, so the goal total stays
-                # 15.0 and the floor arithmetic below is unchanged -- the next
-                # run stays directly comparable to the previous config.
-                #
-                # com_height is omitted entirely rather than set to 0.0: this
-                # weights class does not inherit, so an absent key simply does
-                # not exist, and zero-weighted keys are pruned at startup
-                # anyway. Holding a height does not itself buy stability, and
-                # the physics already discourages the crouch it guarded
-                # against -- see Go2Stand._reward_com_height, which stays on
-                # the class so re-enabling it is one line here.
                 com_vel_xy = 1.0
-                # The pendulum's pivot tracks the live feet, so the balance
-                # terms no longer notice a foot sliding. These two charge for
-                # foot motion directly instead -- which is the honest way
-                # round, since a pinned pivot penalizes drift by corrupting
-                # the balance signal rather than by pricing it. Support also
-                # keeps the model's own precondition true: in free flight the
-                # reduced-order model does not apply at all.
+                # The pivot tracks the live feet, so the balance terms do not
+                # notice a foot sliding; these charge for foot motion directly
+                # instead of corrupting the balance signal with it. Support
+                # also keeps the model's precondition true -- in free flight
+                # the reduced-order model does not apply at all.
                 front_feet_drift = 2.0
                 front_feet_support = 1.5
-                # Yaw, separate from balance_momentum so it cannot swamp the
-                # pitch gradient -- see Go2Stand._reward_balance_yaw.
+                # Separate from balance_momentum so it cannot swamp the pitch
+                # gradient -- see Go2Stand._reward_balance_yaw.
                 balance_yaw = 1.0
                 # Not a shaping term -- a constant that keeps the per-step
                 # total strictly positive. Without it, riding a fall down
@@ -363,8 +329,8 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # only gradient available to an untrained policy points at
                 # falling faster.
                 #
-                # Every _shaped term floors at -0.6 and front_feet_drift, on
-                # the logarithmic tail, floors at -0.743, so the constraint is
+                # Every _shaped term floors at -0.6, and front_feet_drift on
+                # the logarithmic tail floors at -0.743, so the constraint is
                 #
                 #     balance_alive >= 0.6 * (balance_momentum + balance_offset
                 #                             + com_vel_xy + balance_yaw)
@@ -374,19 +340,16 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # +0.31. (front_feet_support is a smoothstep in [0, 1] and
                 # cannot go negative, so it never enters.)
                 #
-                # RAISE THIS IF YOU RAISE ANY OF THOSE WEIGHTS -- there is a
-                # test asserting the inequality. The Nov12 run set drift to
-                # 20.0 and left this at 5.5, which put the worst case at
-                # -10.1/step and produced 186 consecutive iterations of
-                # negative total reward.
+                # RAISE THIS IF YOU RAISE ANY OF THOSE WEIGHTS. A test asserts
+                # the inequality; a GPU run would not.
                 balance_alive = 6.0
 
             class termination_weight:
                 # The terminal reward is -weight * dt, so this is tiny by
                 # construction, and deliberately so: the real disincentive to
                 # falling is the forgone future return. Normal weights are
-                # masked off on a terminating step, so dying gives up ~10/step
-                # over the discount horizon.
+                # masked off on a terminating step, so dying gives up the full
+                # per-step total over the discount horizon.
                 termination = 0.01
 
     class algorithm(Go2RunnerCfg.algorithm):
@@ -396,11 +359,10 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
         # high the cap was set. set_discount_rates() converts this using
         # ctrl_dt (task_registry.set_discount_rates).
         discount_horizon = 3.0
-        # Keep locomotion's 0.01. At 0.001 exploration collapsed -- action_std
-        # fell 1.00 -> 0.11 and was already 0.39 by iteration 301 -- and the
-        # policy locked into a rigid 1.2 s hold before it could discover active
-        # balance. In the run that reached 10 s, action_std *rose* to 1.68;
-        # that was exploration staying healthy, not a fault to suppress.
+        # Locomotion's value, and not to be lowered: at 0.001 exploration
+        # collapses (action_std 1.00 -> 0.11) and the policy locks into a rigid
+        # sub-second hold before it can discover active balance. A rising
+        # action_std is exploration staying healthy here, not a fault.
         entropy_coef = 0.01
 
     class runner(Go2RunnerCfg.runner):

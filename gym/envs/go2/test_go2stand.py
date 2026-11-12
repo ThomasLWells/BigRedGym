@@ -310,14 +310,13 @@ def test_height_reward_is_two_sided():
 
 
 def test_yaw_is_costed_by_its_own_term_and_cannot_swamp_the_balance_signal():
-    """Yaw was uncosted and a policy duly pivoted about one foot.
+    """Yaw is costed, and by a separate term rather than a third component of
+    balance_momentum's norm.
 
-    It is costed now, but as a separate term rather than a third component of
-    balance_momentum's norm. That separation is the point: the gradient of a
-    norm splits as v_i/||v||, and yaw momentum is excited so much more easily
-    than pitch (I_zz = 0.136 vs I_yy = 6.48 kg m^2) that it reaches 97% of a
-    combined norm within 0.1 s of exploration -- leaving the balance signal
-    with almost none of its own gradient.
+    The separation is the point: a norm's gradient splits as v_i/||v||, and
+    yaw momentum is excited so much more easily than pitch (I_zz = 0.136 vs
+    I_yy = 6.48 kg m^2) that it reaches 97% of a combined norm within 0.1 s of
+    exploration, leaving the balance signal with almost none of its own.
     """
     spinning = _reward_task(momentum=(0.0, 0.0, 0.01))
     assert spinning._reward_balance_yaw().item() < 1.0, "yaw must not be free"
@@ -333,12 +332,12 @@ def test_yaw_is_costed_by_its_own_term_and_cannot_swamp_the_balance_signal():
 
 
 def test_yaw_tolerance_is_not_saturated_by_exploration_noise():
-    """The front_feet_drift lesson, applied before it bites again.
+    """A term pinned at its clamp is constant, and a constant is invisible to
+    PPO at any weight.
 
-    A term pinned at its clamp is constant, and a constant is invisible to
-    PPO at any weight. Yaw momentum measured under exploration-scale random
-    actions peaks at |L_z|/N = 0.0129, which must stay clear of the e = 3
-    clamp or the term is inert from the first iteration.
+    Yaw momentum under exploration-scale random actions peaks at
+    |L_z|/N = 0.0129, which must stay clear of the e = 3 clamp or the term is
+    inert from the first iteration.
     """
     measured_exploration_peak = 0.0129
     tolerance = Go2StandCfg.reward_settings.yaw_momentum_tolerance
@@ -349,17 +348,15 @@ def test_yaw_tolerance_is_not_saturated_by_exploration_noise():
     assert hot._reward_balance_yaw().item() < -0.2
 
 
-def test_drift_keeps_pushing_back_far_past_the_old_clamp():
-    """The regression test for the bug this term shipped with.
+def test_drift_gradient_survives_many_tolerances_of_displacement():
+    """Drift must never flatten into a constant.
 
-    _shaped clamps its linear tail at e = 3, so with a 0.05 m tolerance the
-    drift term was exactly constant beyond 0.15 m. Drift accumulates
-    monotonically against a reset-planted anchor, so it crossed that in ~0.5 s
-    and spent 94-96% of every episode at a flat -0.6. A constant is invisible
-    to PPO -- GAE cancels it and advantages are variance-normalized -- so
-    raising the weight tenfold changed nothing measurable.
-
-    Under the old code every assertion below is an equality.
+    It accumulates monotonically against a reset-planted anchor, so it reaches
+    any clamp within about half a second and stays there for the rest of the
+    episode. A constant is invisible to PPO -- GAE cancels it and advantages
+    are variance-normalized -- so a clamped term's weight would stop meaning
+    anything. Hence the logarithmic tail; with _shaped's clamp instead, every
+    assertion below is an equality.
     """
     scores = [
         _reward_task(drift=d)._reward_front_feet_drift().item() for d in (0.3, 0.5, 1.0)
@@ -372,11 +369,12 @@ def test_drift_keeps_pushing_back_far_past_the_old_clamp():
 
 
 def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
-    """The clamp that removes the suicide incentive.
+    """Every tail is bounded, so riding a fall down is never worth less than
+    terminating.
 
-    Unbounded, the linear tail makes riding a fall down cost more per step
-    than terminating (-weight * dt = -1e-4), and an untrained policy's only
-    gradient would point at falling faster.
+    A terminating step costs only -weight * dt = -1e-4, so an unbounded tail
+    would make finishing the fall the best available action -- and the only
+    gradient an untrained policy has.
     """
     far = _reward_task(
         offset=(100.0, 0.0),

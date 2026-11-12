@@ -5,47 +5,32 @@ rotation about that line is underactuated: the robot *is* the 2D variable-height
 inverted pendulum of Koolen, Posa & Tedrake, "Balance control using center of
 mass height variation" (Humanoids 2016).
 
-The governing identity, for a stationary contact point p and whole-body centre
-of mass c:
+The governing identity, for contact point p and whole-body centre of mass c:
 
     d/dt L_p = (c - p) x m g
 
-The contact cannot exert a torque about the contact line -- the feet are 22 mm
+The contact exerts no torque about the contact line -- the feet are 22 mm
 spheres -- so this holds for the whole articulated robot, not just a point mass.
-Therefore L_p held at zero means the centre of mass is over the contact line,
-which is the definition of balanced. One scalar subsumes lean angle, lean rate,
-and "am I about to fall".
+L_p held at zero therefore means the centre of mass is over the contact line,
+which is the definition of balanced: one scalar subsuming lean angle, lean rate
+and "am I about to fall". It is exact only for a stationary p, and p is tracked
+live, so a sliding foot adds an unmodelled -m * pdot x cdot term;
+_reward_front_feet_drift bounds pdot, which bounds that error.
 
-The identity is exact only for a stationary p, and p is tracked live here, so
-a sliding foot adds an unmodelled -m * pdot x cdot. That is a deliberate
-trade: pinning p would keep the identity exact but make the reward *wrong*
-after any drift, pointing the robot away from the support it is actually
-standing on. Keeping p live and charging for drift separately
-(_reward_front_feet_drift) bounds pdot instead, which bounds the error term.
+Three terms are functions of the reduced-order state alone -- momentum, offset,
+horizontal centre-of-mass speed -- and name no joint, foot or posture, so the
+policy is free to choose *how* it balances. Two foot terms and a yaw term cover
+what the model cannot see, and a constant alive bonus keeps the per-step total
+positive.
 
-That is the core of the reward, plus a horizontal offset term to supply a
-direct position gradient and a horizontal centre-of-mass speed term to close
-the one loophole L_p leaves open (the rear legs can be swung to null L_p while
-the body translates underneath). Those three are functions of the reduced-order
-state alone: none of them mentions a joint, a foot, or a posture, so the policy
-is free to choose how it balances.
-
-Note what is *not* costed: vertical centre-of-mass motion. Raising and lowering
-the centre of mass is the authority the paper studies, so charging for it would
-be charging for the mechanism. A height target exists on the class but is
-zero-weighted -- see _reward_com_height.
-
-Two foot terms sit alongside them -- drift and contact -- because the pivot is
-tracked live rather than pinned at reset, so the balance terms deliberately do
-not notice the feet moving. And a constant alive bonus keeps the per-step total
-positive, without which riding a fall down costs more than terminating does.
-
-In particular the paper's assumption that centroidal angular momentum stays zero
--- which forces the ground reaction force through the centre of mass -- is
-deliberately *not* imposed here. Only the total about the contact point is
-rewarded, so the policy may swing the rear legs as a flywheel to cancel L_p
-during a recovery and gets paid for doing it. What it cannot do is hold L_p at
-zero that way, because the identity above has no term it can fake.
+Two things are deliberately uncosted. Vertical centre-of-mass motion, because
+raising and lowering the centre of mass is the authority the paper studies and
+charging for it would be charging for the mechanism. And centroidal angular
+momentum: the paper assumes it stays zero, which forces the ground reaction
+force through the centre of mass, and relaxing that lets the policy swing the
+rear legs as a flywheel to cancel L_p during a recovery. What the flywheel
+cannot do is *hold* L_p at zero, because the identity above has no term it can
+fake.
 """
 
 import math
@@ -62,9 +47,9 @@ class Go2Stand(Go2):
     def _init_buffers(self):
         super()._init_buffers()
 
-        # The support pair is taken from the layout's canonical foot order
-        # rather than hardcoded indices, so a layout change cannot silently
-        # swap which feet are expected to carry the robot.
+        # Resolved through the layout's canonical foot order rather than
+        # hardcoded, so a layout change cannot silently swap which pair is
+        # expected to carry the robot.
         foot_names = self.robot_layout.body_groups["feet"]
         self.front_feet_indices = self.feet_indices.index_select(
             0, self._prefix_subset(foot_names, ("FL", "FR"))
@@ -76,15 +61,13 @@ class Go2Stand(Go2):
             device=self.device,
         )
 
-        # The pendulum's pivot, tracked live on the support feet -- see
-        # _update_support_frame for why it is not captured at reset.
+        # The pendulum's pivot, tracked live -- see _update_support_frame.
         self._support_anchor = torch.zeros(
             self.num_envs, 3, dtype=torch.float, device=self.device
         )
-        # Where each support foot was planted, captured at reset. This is the
-        # one thing that does stay pinned: it is the reference for foot drift,
-        # which is a genuine "how far has this foot moved" question rather than
-        # part of the pendulum's state.
+        # Where each support foot was planted, pinned at reset. The reference
+        # for foot drift, which is a "how far has this foot moved" question
+        # rather than part of the pendulum's state.
         self._front_feet_anchor = torch.zeros(
             self.num_envs,
             len(self.front_feet_indices),
@@ -93,13 +76,11 @@ class Go2Stand(Go2):
             device=self.device,
         )
         # Rows are the support frame's x and y axes in world coordinates: y
-        # along the contact line, x perpendicular to it.
-        #
-        # This does nothing for the rewards -- they are rotation-invariant
-        # norms, so a yaw rotation cannot change them. It is here for the
+        # along the contact line, x perpendicular to it. This buys the rewards
+        # nothing -- they are rotation-invariant norms. It exists for the
         # *observations*: com_offset, com_vel and support_momentum are vectors,
-        # and in world axes they would leak absolute yaw into the critic the
-        # moment a curriculum stage widens root_pos_range's yaw off [0, 0].
+        # and in world axes they would leak absolute yaw into the critic as
+        # soon as a curriculum stage widens root_pos_range's yaw off [0, 0].
         self._support_rot = torch.zeros(
             self.num_envs, 2, 2, dtype=torch.float, device=self.device
         )
@@ -117,23 +98,21 @@ class Go2Stand(Go2):
             self.num_envs, 3, dtype=torch.float, device=self.device
         )
 
-        # Per-axis tolerances, in the support frame. The axis roles are
+        # Per-axis tolerances in the support frame. The axis roles are
         # OPPOSITE for a displacement and a rotation, which is the easiest
         # thing here to transpose by accident:
         #
-        #   offset along x (perpendicular to the contact line) is the knife
-        #     edge -- there is no support polygon at all in that direction;
-        #   offset along y stays inside the 0.142 m half-width, so it is
-        #     comparatively harmless;
+        #   offset along x crosses the contact line, where there is no support
+        #     polygon at all -- the knife edge, so tight;
+        #   offset along y stays inside the 0.142 m half-width -- loose;
         #   momentum about x is roll, which the 0.284 m foot separation
-        #     arrests;
-        #   momentum about y is pitch about the contact line -- the
-        #     underactuated mode, and the whole point of the task.
+        #     arrests -- loose;
+        #   momentum about y is pitch about the contact line, the
+        #     underactuated mode and the whole point of the task -- tight.
         #
-        # So tight-x/loose-y for offset, and loose-x/tight-y for momentum.
-        # Built here rather than read from the config each call because
-        # reward_settings is read directly, not through class_to_dict, so a
-        # bare Python list would not broadcast.
+        # Built as tensors here because reward_settings is read directly
+        # rather than through class_to_dict, so a bare list would not
+        # broadcast.
         self._offset_tolerance = torch.tensor(
             self.cfg.reward_settings.support_offset_tolerance,
             dtype=torch.float,
@@ -150,52 +129,48 @@ class Go2Stand(Go2):
 
     def _reset_idx(self, reset_mask):
         super()._reset_idx(reset_mask)
-        # dof_pos_target is a residual: _compute_torques adds default_dof_pos
-        # to it. LeggedRobot._reset_idx seeds it with default_dof_pos itself,
-        # which would make the PD target twice the support posture on the
-        # first step after every reset. Go2Trot._reset_idx corrects the same
-        # thing; zero means "hold the posture you were reset into".
+        # dof_pos_target is a residual that _compute_torques adds
+        # default_dof_pos to, and LeggedRobot._reset_idx seeds it *with*
+        # default_dof_pos -- which would make the PD target twice the support
+        # posture on the first step after every reset. Zero means "hold the
+        # posture you were reset into".
         self.dof_pos_target.masked_fill_(reset_mask.unsqueeze(1), 0.0)
         masked_update(
             self.dof_pos_history,
             self.dof_pos_target.tile(1, 3),
             reset_mask,
         )
-        # Re-plant the drift reference wherever the reset put the feet. The
-        # backend has already run a forward pass and re-synced the assembled
-        # states by this point (mj_forward + _copy_env_state_from_mujoco on
-        # CPU, mjw.forward + _sync_assembled_states on warp), so the foot
-        # positions read here are genuinely post-reset.
+        # Re-plant the drift reference. The backend has already run a forward
+        # pass and re-synced the assembled states, so these foot positions are
+        # genuinely post-reset.
         masked_update(
             self._front_feet_anchor,
             self._rigid_body_pos[:, self.front_feet_indices, :2],
             reset_mask,
         )
-        # Refresh here rather than in _refresh_base_observations: that runs
-        # earlier inside super()._reset_idx(), and it is the only caller, so
-        # doing it here covers the reset path with the post-reset state.
+        # Here rather than in _refresh_base_observations, which runs earlier
+        # inside super() and is its only caller; doing it here covers the
+        # reset path with post-reset state.
         self._update_support_frame()
         self._update_reduced_order_state()
 
     def _post_decimation_step(self):
         super()._post_decimation_step()
-        # Control rate, alongside projected_gravity. super() comes first
-        # because _push_robots writes root_states and re-syncs the rigid-body
-        # tensors, which moves everything read below. These are written in
-        # place into buffers allocated once, never refreshed lazily from a
-        # property getter -- that pattern previously left GPU training reading
-        # frozen observations for an entire run.
+        # Control rate, alongside projected_gravity. super() first, because
+        # _push_robots writes root_states and re-syncs the rigid-body tensors
+        # that everything below reads. Written in place into buffers allocated
+        # once: refreshing lazily from a property getter instead would leave
+        # GPU training reading stale values for a whole run.
         self._update_support_frame()
         self._update_reduced_order_state()
 
     def _check_terminations_and_timeouts(self):
         super()._check_terminations_and_timeouts()
         # End the episode once the attitude is past recovery. The inherited
-        # check only fires when the trunk actually touches down, long after
-        # the fall is decided, so without this most of the rollout is spent
-        # sampling a robot that is already on the ground. This is a
-        # sample-efficiency gate, not a shaping term -- nothing rewards
-        # attitude directly.
+        # check only fires when the trunk touches down, long after the fall is
+        # decided, so without this most of the rollout samples a robot that is
+        # already on the ground. A sample-efficiency gate, not a shaping term:
+        # no reward mentions attitude.
         attitude_error = torch.norm(
             self.projected_gravity - self._target_projected_gravity, dim=1
         )
@@ -214,25 +189,24 @@ class Go2Stand(Go2):
     def _update_support_frame(self):
         """Track the pendulum's pivot and axes on the live support feet.
 
-        Live, not captured at reset. A pivot frozen at reset gives an actively
-        wrong gradient once the feet have moved: the robot can be balanced over
-        its real support and still read a large offset, and the only way to
-        reduce that offset is to lean away from where it is actually standing,
-        which is to say, to fall. Foot motion is charged for by
-        _reward_front_feet_drift instead, which measures it directly.
+        Live rather than pinned at reset, because a pinned pivot gives an
+        actively wrong gradient once the feet have moved: the robot can be
+        balanced over its real support and still read a large offset, and the
+        only way to null that offset is to lean off the feet. Foot motion is
+        charged for by _reward_front_feet_drift, which measures it directly.
         """
         feet = self._rigid_body_pos.index_select(1, self.front_feet_indices)
         self._support_anchor[:] = feet.mean(dim=1)
 
-        # y along the contact line, from the right foot to the left one. The
-        # feet are listed in the layout's canonical order, so index 0 is FL.
+        # y along the contact line, right foot to left; index 0 is FL in the
+        # layout's canonical order.
         span = feet[:, 0, :2] - feet[:, 1, :2]
-        # Guarded divide, not a bare one: the hip range is +/-1.047 rad, which
-        # is enough abduction to bring the feet together, and a nan here would
-        # reach the critic's observation vector.
+        # Guarded divide: the hip range is +/-1.047 rad, enough abduction to
+        # bring the feet together, and a nan here reaches the critic's
+        # observation vector.
         y_axis = span / torch.clamp(torch.norm(span, dim=1, keepdim=True), min=1e-6)
-        # x is y rotated -90 degrees in the horizontal plane, which points along
-        # the robot's nose for the canonical FL/FR ordering.
+        # x is y rotated -90 degrees in the horizontal plane, which points
+        # along the robot's nose for the canonical FL/FR ordering.
         x_axis = torch.stack((y_axis[:, 1], -y_axis[:, 0]), dim=1)
         self._support_rot[:] = torch.stack((x_axis, y_axis), dim=1)
 
@@ -246,20 +220,19 @@ class Go2Stand(Go2):
 
         Returned in the support frame, as (offset, height, velocity, momentum).
 
-        Link positions and velocities are those of each body's *origin* rather
-        than its centre of mass, and the per-link spin term sum(I_i w_i) is
-        left out. Measured against an exact centroidal computation, the result
-        is within 2% once |L| exceeds about 1 kg m^2/s, and both the proxy and
-        the truth are exactly zero when the robot is static -- so the reward's
-        optimum sits where the true one does.
+        Link positions and velocities are each body's *origin* rather than its
+        centre of mass, and the per-link spin term sum(I_i w_i) is left out.
+        Against an exact centroidal computation that is within 2% once |L|
+        exceeds about 1 kg m^2/s, and both the proxy and the truth are exactly
+        zero when the robot is static, so the reward's optimum sits where the
+        true one does.
 
-        The one place it bites is height and horizontal offset at the goal:
-        the proxy reads the centre of mass 8.9 mm high and 2.2 mm forward of
-        the truth. The height bias is absorbed by measuring com_height_target
-        with this same proxy. The 2.2 mm is in the knife-edge direction and is
-        accepted: a converged policy holds the true centre of mass that far
-        behind the contact line, a standing 0.35 Nm, which is 0.037 error
-        units against support_offset_tolerance.
+        Where it bites is at the goal: the proxy reads the centre of mass
+        8.9 mm high and 2.2 mm forward of the truth. The height bias cancels
+        because com_height_target is measured with this same proxy. The 2.2 mm
+        lies in the knife-edge direction and is accepted -- a converged policy
+        holds the true centre of mass that far behind the contact line, a
+        standing 0.35 Nm, worth 0.037 error units.
         """
         mass = self._backend.link_mass.unsqueeze(-1)
         total_mass = self._backend.link_mass.sum(dim=1, keepdim=True)
@@ -271,8 +244,8 @@ class Go2Stand(Go2):
             dim=1
         )
 
-        # Normalize by m * h * sqrt(g * h): the angular momentum of the whole
-        # robot tipping at the pendulum's own natural rate, so the number is
+        # Normalize by m * h * sqrt(g * h), the angular momentum of the whole
+        # robot tipping at the pendulum's natural rate, so the number is
         # dimensionless and O(1) at the edge of recoverability. Built from the
         # live per-environment mass, so mass randomization cannot move the
         # reward's zero.
@@ -300,7 +273,7 @@ class Go2Stand(Go2):
         """Upward foot force as a fraction of its expected share of body weight.
 
         ``share`` is how much of the robot's weight one of these feet carries
-        when the pose is held. Normalizing by the total instead caps a
+        when the pose is held. Normalizing by the total instead would cap a
         two-footed support term at half its weight, since neither foot can
         read more than 0.5. The division has to happen before the smoothstep,
         which is why this is a parameter rather than a factor on the result.
@@ -318,45 +291,38 @@ class Go2Stand(Go2):
     def _shaped(self, error):
         """Squared exponential with a bounded linear tail.
 
-        The linear companion is not decoration: _sqrdexp is exp(-4e^2) here,
-        whose derivative is numerically zero past about e = 1.5, which would
-        leave a falling robot with no gradient telling it which way to correct.
+        The linear companion carries the far field: _sqrdexp is exp(-4e^2)
+        here, whose derivative is numerically zero past about e = 1.5, leaving
+        a falling robot with no gradient telling it which way to correct.
 
-        The clamp is load-bearing for a different reason. Unbounded, the tail
-        makes a marginal state worth *less* than a terminating one: on a
-        terminating step the dense weights are masked off and only
-        termination_weight fires, costing -weight * dt = -1e-4, while riding a
-        fall down costs far more per step. Early in training, when no policy
-        can hold the pose yet, that is the only gradient available and it
-        points at falling faster. Clamping bounds each term at -0.6, and
-        _reward_balance_alive then pays for the rest. LeggedRobot's
-        _reward_dof_vel_limits clips for the same reason.
+        The clamp bounds each term at -0.6 so that riding a fall down is never
+        worth less than terminating. A terminating step masks off the dense
+        weights and costs only -weight * dt = -1e-4, so an unbounded tail
+        would make "finish the fall quickly" the best available action -- and
+        early in training, when nothing can hold the pose, the only gradient
+        there is. _reward_balance_alive pays for the bounded remainder.
         """
         return self._sqrdexp(error) - 0.2 * error.clamp(max=3.0)
 
     def _shaped_log_tail(self, error):
         """Squared exponential with a tail that never goes flat.
 
-        _shaped's clamp is right for the balance terms: a falling robot
-        terminates, so it cannot park in the saturated region for long. It is
-        fatal for anything that accumulates monotonically *within* an episode.
-        Foot drift crossed three tolerances in about 0.5 s and then sat at a
-        constant -0.6 for 94-96% of every rollout, and a constant is invisible
-        to PPO at any weight -- GAE cancels it once the critic adapts, and
-        advantages are variance-normalized on top of that. Raising the drift
-        weight from 2.0 to 20.0 changed nothing at all: both runs converged to
-        an unweighted term of -0.533 +/- 0.001.
+        For quantities that accumulate monotonically within an episode, a
+        clamped tail is fatal: once past the clamp the term is a constant, and
+        a constant is invisible to PPO at any weight -- GAE cancels it as soon
+        as the critic adapts, and advantages are variance-normalized on top of
+        that. Foot drift is the one such quantity here, so raising its weight
+        would otherwise do nothing at all.
 
         log1p keeps the far field bounded in practice while never zeroing the
-        gradient, which is -0.2/(1+e). Note this is *weaker* than the clamped
-        tail in the near field (-1.33 vs -4.00 per metre at 0.10 m of drift);
-        the point is not a bigger push but a push that survives, so that the
-        weight is a working knob again.
+        gradient, which stays at -0.2/(1+e). This is *weaker* than the clamped
+        tail in the near field (-1.33 against -4.00 per metre at 0.10 m of
+        drift); the point is not a bigger push but one that survives, so that
+        the weight is a working knob.
 
         The clamp at e = 40 is a floor guard at 2 m of drift, not a shaping
         choice -- com_vel_xy dominates long before that. It bounds the term at
-        -0.743, which is what the strict-positivity sum in
-        _reward_balance_alive is computed against.
+        -0.743, which is what _reward_balance_alive's sum is computed against.
         """
         return self._sqrdexp(error) - 0.2 * torch.log1p(error.clamp(max=40.0))
 
@@ -365,33 +331,30 @@ class Go2Stand(Go2):
 
         Sized so the per-step total stays strictly positive everywhere in the
         reachable state space. The four _shaped terms bottom out at
-        -0.6 * (3 + 2 + 1 + 1) = -4.2 weighted and front_feet_drift, on the
-        logarithmic tail, bottoms at -0.743 * 2.0 = -1.49, for a floor of
-        -5.69 against this term's 6.0 (front_feet_support is a smoothstep in
-        [0, 1] and cannot go negative). The constraint to preserve when
-        retuning is
+        -0.6 * (3 + 2 + 1 + 1) = -4.2 weighted, and front_feet_drift on the
+        logarithmic tail bottoms at -0.743 * 2.0 = -1.49, for a floor of -5.69
+        against this term's 6.0 (front_feet_support is a smoothstep in [0, 1]
+        and cannot go negative). The constraint to preserve when retuning:
 
             balance_alive >= 0.6 * sum(clamped term weights)
                              + 0.743 * front_feet_drift
 
-        It says nothing about *how* to balance, so it does not re-specify the
-        solution the way the twelve terms it replaces did.
+        Being constant, it says nothing about *how* to balance, so it adds no
+        shaping of its own.
         """
         return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
 
     def _reward_balance_momentum(self):
         """Angular momentum about the support anchor -> 0. The balance signal.
 
-        All three axes, with per-axis tolerances. Momentum about y -- the
-        contact line -- is the exact reduced-order coordinate and the
-        underactuated mode, so it gets the tight tolerance. Momentum about x
-        is roll, which the 0.284 m foot separation actually arrests, so it
-        gets a looser one. Note this is the opposite assignment to
-        _reward_balance_offset; see _init_buffers.
+        Horizontal components, with per-axis tolerances. Momentum about y --
+        the contact line -- is the exact reduced-order coordinate and the
+        underactuated mode, so it gets the tight tolerance; about x is roll,
+        which the 0.284 m foot separation arrests, so it gets a looser one.
+        Note this is the opposite assignment to _reward_balance_offset; see
+        _init_buffers.
 
-        Horizontal components only. Yaw is costed too, but by
-        _reward_balance_yaw rather than by joining this norm -- see there for
-        why that separation is load-bearing.
+        Yaw is costed by _reward_balance_yaw rather than by joining this norm.
         """
         error = torch.norm(
             self.support_momentum[:, :2] / self._momentum_tolerance, dim=1
@@ -401,21 +364,19 @@ class Go2Stand(Go2):
     def _reward_balance_yaw(self):
         """Angular momentum about the vertical -> 0.
 
-        Yaw was uncosted and a policy duly found the free degree of freedom
-        and started pivoting about one foot. Nothing else could see it:
-        gravity exerts no torque about the vertical so it is outside the
-        reduced-order model, and projected_gravity is yaw-invariant so even
-        the attitude termination is blind to a spin.
+        Gravity exerts no torque about the vertical, so yaw sits outside the
+        reduced-order model, and projected_gravity is yaw-invariant so the
+        attitude termination is blind to a spin. Nothing else can see it.
 
-        A separate term, not a third component of _reward_balance_momentum's
-        norm, and that is not cosmetic. The gradient of a norm splits between
-        its components as v_i/||v||, so the largest component owns it.
-        Measured under exploration-scale actions, yaw momentum reaches 97% of
-        the combined norm within 0.1 s and holds 72-76% through a fall -- it
-        is excited far more easily than pitch because I_zz about the contact
-        line is 0.136 kg m^2 against I_yy = 6.48. Folded into one norm it
-        would leave the actual balance signal with 3-25% of its own gradient.
-        Split out, each keeps its own.
+        A separate term rather than a third component of
+        _reward_balance_momentum's norm, and that separation is load-bearing.
+        A norm's gradient splits between its components as v_i/||v||, so the
+        largest component owns it -- and yaw is excited far more easily than
+        pitch, I_zz about the contact line being 0.136 kg m^2 against
+        I_yy = 6.48. Under exploration-scale actions yaw momentum reaches 97%
+        of a combined norm within 0.1 s and holds 72-76% through a fall, which
+        would leave the balance signal with a fraction of its own gradient.
+        Split out, each keeps all of it.
         """
         error = (
             self.support_momentum[:, 2].abs()
@@ -426,21 +387,20 @@ class Go2Stand(Go2):
     def _reward_balance_offset(self):
         """Hold the centre of mass over the support anchor.
 
-        Redundant with the momentum term only in the limit: dL/dt = (c - p) x mg
+        Overlaps the momentum term only in the limit: dL/dt = (c - p) x mg
         means a steady lean shows up there eventually, but weakly and late.
         This supplies the position gradient directly.
 
         Per-axis, and the opposite way round to _reward_balance_momentum: a
-        displacement along x leaves the contact line, where there is no
-        support polygon at all, so that is the tight axis; a displacement
-        along y stays inside the 0.142 m half-width and is comparatively
-        harmless.
+        displacement along x crosses the contact line, where there is no
+        support polygon, so that is the tight axis; along y it stays inside
+        the 0.142 m half-width and is comparatively harmless.
 
         The x tolerance is sized against the momentum term's so neither
-        dominates: one momentum tolerance is dL = 3.4 kg m^2/s, i.e.
+        dominates. One momentum tolerance is dL = 3.4 kg m^2/s, i.e.
         cdot = dL / (m h) = 0.36 m/s, which at the pendulum's natural rate
-        w0 = sqrt(m g h / I) = 3.82 rad/s is 0.094 m of capture-point offset.
-        0.06 is two-thirds of that, keeping the two terms within a factor 1.6.
+        w0 = sqrt(m g h / I) = 3.82 rad/s is 0.094 m of capture-point offset;
+        0.06 is two-thirds of that, keeping the two within a factor 1.6.
         """
         error = torch.norm(self.com_offset / self._offset_tolerance, dim=1)
         return self._shaped(error)
@@ -448,28 +408,21 @@ class Go2Stand(Go2):
     def _reward_com_height(self):
         """Two-sided tracking of the centre-of-mass height above the feet.
 
-        Currently zero-weighted and therefore never called -- holding a height
-        does not itself make the pose more stable, which is what the task is
-        for right now. Kept because re-enabling it is a one-line weight
-        change, and because the physics argues it is not urgently needed: for
-        an inverted pendulum the divergence rate is sqrt(m g h / I), and
-        folding the rear legs cuts I faster than h, taking the robot from
-        3.78 rad/s to roughly 5 rad/s. Crouching makes balancing *harder*, so
-        the policy is already paid not to do it by every other term.
+        Zero-weighted, so never called. Holding a height does not itself make
+        the pose more stable, and the physics already discourages the crouch
+        it would guard against: for an inverted pendulum the divergence rate
+        is sqrt(m g h / I), and folding the rear legs cuts I faster than h,
+        taking the robot from 3.78 rad/s to roughly 5 rad/s. Kept because
+        re-enabling it is a one-line weight change.
 
-        Note cfg.reward_settings.com_height_target stays load-bearing while
-        this is off: _compute_reduced_order_state uses it as the pendulum
-        length in the angular-momentum normalizer.
+        cfg.reward_settings.com_height_target stays load-bearing while this is
+        off -- _compute_reduced_order_state uses it as the pendulum length in
+        the angular-momentum normalizer.
 
-        Replaces both min_base_height and the old rear-leg posture anchor:
-        curling the rear legs draws the centre of mass down, so extension is
-        paid for directly rather than through a joint-space target.
-
-        The tolerance is three times looser than the base-height tracker it
-        replaces. Varying centre-of-mass height is the control authority the
-        paper is about, so a tight tracker would clamp away the one mechanism
-        the reduced-order model actually studies -- but exp(-4e^2) is sharp,
-        so "loose" here still means a few centimetres costs something.
+        The tolerance is loose, because varying centre-of-mass height is the
+        control authority the paper is about and a tight tracker would clamp
+        away the one mechanism it studies. exp(-4e^2) is sharp, though, so
+        "loose" still means a few centimetres costs something.
         """
         error = (
             self.com_height.squeeze(1) - self.cfg.reward_settings.com_height_target
@@ -480,20 +433,20 @@ class Go2Stand(Go2):
         """Penalize horizontal centre-of-mass speed, leaving vertical free.
 
         The split is the reduced-order model's own: vertical motion is the
-        control authority the paper is about -- the robot raises and lowers
-        its centre of mass to arrest a lean -- while horizontal motion is the
-        divergent coordinate, and sustained horizontal travel means the robot
-        is relocating rather than balancing.
+        control authority -- the robot raises and lowers its centre of mass to
+        arrest a lean -- while horizontal motion is the divergent coordinate,
+        and sustained horizontal travel means the robot is relocating rather
+        than balancing.
 
-        Not redundant with _reward_balance_momentum, which is the point.
-        Angular momentum about the pivot can be driven to zero by swinging the
-        rear legs against the trunk, which leaves the body free to translate
-        underneath with L_p still reading ~0. That is the flywheel loophole,
-        and this closes it. Nor is it redundant with _reward_front_feet_drift:
-        drift is an accumulated displacement, this is a rate, so it fires at
-        the start of a lunge rather than after it has finished.
+        It closes the flywheel loophole, which is why it is not redundant with
+        _reward_balance_momentum: angular momentum about the pivot can be
+        driven to zero by swinging the rear legs against the trunk, leaving
+        the body free to translate underneath with L_p still reading ~0. Nor
+        is it redundant with _reward_front_feet_drift -- drift is accumulated
+        displacement, this is a rate, so it fires at the start of a lunge
+        rather than after it has finished.
 
-        Isotropic, unlike the two balance terms. Stepping is equally wrong in
+        Isotropic, unlike the two balance terms: stepping is equally wrong in
         any direction, and the directional part of the task is already carried
         by the anisotropic offset and momentum tolerances.
         """
@@ -506,22 +459,24 @@ class Go2Stand(Go2):
     def _reward_front_feet_drift(self):
         """Displacement of each support foot from where it was planted.
 
-        This is what the pivot no longer does. With the pendulum's pivot
-        tracking the live feet, nothing in the balance terms notices a foot
-        sliding, so foot motion is charged for directly here -- which is also
-        the honest way round, because it penalizes drift instead of corrupting
-        the balance signal with it.
+        The pivot tracks the live feet, so nothing in the balance terms
+        notices a foot sliding; foot motion is charged for here instead. That
+        is the honest way round -- it prices drift rather than corrupting the
+        balance signal with it.
 
         Max over the pair, not mean: a pivot about one planted foot sweeps the
-        other through twice the distance the mean would report, halving the
-        cost of exactly the behaviour this exists to stop.
+        other through twice the distance a mean would report, halving the cost
+        of exactly the behaviour this exists to stop.
 
-        Displacement rather than velocity because the feet are 22 mm spheres.
+        Displacement rather than velocity, because the feet are 22 mm spheres.
         A foot rotating about a stationary contact point moves its body origin
-        at radius x omega with nothing actually sliding, and that rotation is
-        the ankle strategy the task depends on -- 2 rad/s reads as 0.044 m/s
-        of entirely false slip. Drift separates the two: rolling is bounded by
-        the radius, sliding accumulates.
+        at radius x omega with nothing sliding, and that rotation is the ankle
+        strategy the task depends on -- 2 rad/s reads as 0.044 m/s of entirely
+        false slip. Drift separates the two: rolling is bounded by the radius,
+        sliding accumulates.
+
+        The log tail is what keeps that accumulation from saturating the term
+        into a constant -- see _shaped_log_tail.
         """
         drift = (
             self._rigid_body_pos[:, self.front_feet_indices, :2]
@@ -531,24 +486,20 @@ class Go2Stand(Go2):
             torch.amax(torch.norm(drift, dim=-1), dim=1)
             / self.cfg.reward_settings.foot_drift_tolerance
         )
-        # The one term that uses the logarithmic tail. Drift is the only
-        # quantity here that accumulates monotonically within an episode and
-        # therefore reaches _shaped's clamp with certainty rather than only
-        # while falling -- see _shaped_log_tail.
         return self._shaped_log_tail(error)
 
     def _reward_front_feet_support(self):
         """Both support feet loaded at once.
 
-        This keeps the reduced-order model's own precondition true. With a
-        foot off the ground the contact point the momentum is measured about
-        is fictional, and in free flight the model does not apply at all --
-        so without this, extending the legs explosively to raise the centre of
-        mass is an unpriced way to score the height term.
+        Keeps the reduced-order model's own precondition true: with a foot off
+        the ground the contact point the momentum is measured about is
+        fictional, and in free flight the model does not apply at all. Without
+        this, extending the legs explosively is an unpriced way to move the
+        centre of mass.
 
-        The minimum over the pair, not the mean: a mean would let one foot
-        carry everything while the other hops, which is the stepping strategy
-        the paper sets aside and this task is meant to exclude. Two feet carry
-        the robot, so each one's share is half the body weight.
+        Minimum over the pair, not mean: a mean would let one foot carry
+        everything while the other hops, which is the stepping strategy the
+        paper sets aside and this task excludes. Two feet carry the robot, so
+        each one's share is half the body weight.
         """
         return self._foot_load(self.front_feet_indices, share=0.5).amin(dim=1)
