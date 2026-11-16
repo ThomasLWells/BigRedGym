@@ -76,6 +76,21 @@ REAR_CALF = -0.85
 # sampling in the +ve direction would push it past the joint stop.
 CALF_JITTER = 0.03
 
+# Foot collision sphere, from the URDF: <sphere radius="0.022"/> at
+# <origin xyz="-0.002 0 0"/> relative to the foot link origin. Needed to find
+# the contact point, which on flat ground sits directly below the sphere
+# centre -- see Go2Stand._update_foot_slip.
+FOOT_RADIUS = 0.022
+FOOT_SPHERE_OFFSET = [-0.002, 0.0, 0.0]
+# Metres per second past which a slip observation is clipped. Measured over a
+# trained rollout, contact slip runs 0.038 m/s mean and 0.58 m/s at p99, with
+# rare excursions to 7.6 m/s while a robot is already crashing. Clipping at
+# 1.0 keeps the scaled observation bounded near 10 -- the same order as
+# dof_vel's worst case -- without touching the operating range. Observations
+# are not normalized in this task, so an unbounded spike would reach the
+# network raw.
+FOOT_SLIP_MAX = 1.0
+
 
 class Go2StandCfg(Go2Cfg):
     class env(Go2Cfg.env):
@@ -154,6 +169,13 @@ class Go2StandCfg(Go2Cfg):
             "thigh": [-0.1, 0.1],
             "calf": [-0.1, 0.1],
         }
+
+    class asset(Go2Cfg.asset):
+        # Foot geometry, used to locate the contact point rather than by the
+        # physics -- the backend takes its collision shapes from the URDF.
+        foot_radius = FOOT_RADIUS
+        foot_sphere_offset = FOOT_SPHERE_OFFSET
+        foot_slip_max = FOOT_SLIP_MAX
 
     class control(Go2Cfg.control):
         # Two legs carry the whole 16.3 kg (160 N) inverted, so the stance
@@ -277,6 +299,11 @@ class Go2StandCfg(Go2Cfg):
         com_height = HANDSTAND_COM_HEIGHT
         com_offset = 0.1
         com_vel = 0.5
+        # Metres per second per observation unit. Measured contact slip over a
+        # trained rollout: 0.038 mean, 0.093 at p90, 0.58 at p99. At 0.1 a
+        # typical foot reads 0.4 and a real slip event clears 1.0, with the
+        # clip at FOOT_SLIP_MAX bounding it near 10.
+        foot_slip = 0.1
         # support_momentum is deliberately absent: it is already dimensionless
         # and O(0.5) at the edge of recoverability. get_state only divides when
         # the key exists.
@@ -307,6 +334,14 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
             "dof_pos_obs",
             "dof_vel",
             "dof_pos_target",
+            # The one non-proprioceptive entry, and deliberate. Without it the
+            # actor cannot tell a slippery floor from a grippy one, so across
+            # the 0.8-1.0 friction range it can only learn a single policy
+            # that averages over the draw -- domain randomization measures as
+            # 81% of the episode-to-episode spread in foot drift. Slip is what
+            # makes low friction something the policy can respond to rather
+            # than merely suffer.
+            "foot_slip",
         ]
         normalize_obs = False
         actions = ["dof_pos_target"]
@@ -329,6 +364,7 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
             "com_height",
             "com_vel",
             "support_momentum",
+            "foot_slip",
         ]
         normalize_obs = False
 

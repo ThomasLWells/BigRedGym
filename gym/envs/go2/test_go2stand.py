@@ -413,3 +413,61 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     # com_height is off: an absent key, not a zero, because this weights class
     # does not inherit. If it is ever re-enabled it joins the sum above.
     assert not hasattr(weights, "com_height")
+
+
+def _slip_task(linear, angular, quaternion=(0.0, 0.0, 0.0, 1.0)):
+    """A Go2Stand carrying just the two front feet, moving as given."""
+    task = Go2Stand.__new__(Go2Stand)
+    task.cfg = Go2StandCfg()
+    task.num_envs = 1
+    task.device = "cpu"
+    task.front_feet_indices = torch.tensor([0, 1])
+    task.foot_slip = torch.zeros(1, 2)
+    task._foot_sphere_offset = torch.tensor(Go2StandCfg.asset.foot_sphere_offset)
+    task._foot_contact_drop = torch.tensor([0.0, 0.0, -Go2StandCfg.asset.foot_radius])
+    task._rigid_body_quat = torch.tensor([[list(quaternion)] * 2])
+    task._rigid_body_lin_vel = torch.tensor([[list(linear)] * 2])
+    task._rigid_body_ang_vel = torch.tensor([[list(angular)] * 2])
+    return task
+
+
+def test_pure_rolling_reads_as_no_slip():
+    """The reason slip is measured at the contact point and not at the body
+    origin. A 22 mm sphere rolling without sliding still moves its origin at
+    radius x omega, which an origin-velocity measure would report as slip."""
+    rate = 3.0
+    radius = Go2StandCfg.asset.foot_radius
+    # omega about +y with the contact below gives the contact point
+    # -rate*radius in x, so an origin moving at +rate*radius rolls exactly.
+    task = _slip_task(linear=(rate * radius, 0.0, 0.0), angular=(0.0, rate, 0.0))
+    task._update_foot_slip()
+
+    origin_speed = torch.linalg.norm(task._rigid_body_lin_vel[0, 0, :2]).item()
+    assert origin_speed == pytest.approx(rate * radius, rel=1e-5)
+    assert origin_speed > 0.06, "the test is vacuous if the origin is not moving"
+    torch.testing.assert_close(task.foot_slip, torch.zeros(1, 2), atol=2e-4, rtol=0)
+
+
+def test_a_sliding_foot_reports_its_own_speed():
+    task = _slip_task(linear=(0.12, -0.05, 0.0), angular=(0.0, 0.0, 0.0))
+    task._update_foot_slip()
+    expected = math.hypot(0.12, 0.05)
+    torch.testing.assert_close(
+        task.foot_slip, torch.full((1, 2), expected), rtol=1e-5, atol=0
+    )
+
+
+def test_vertical_foot_motion_is_not_slip():
+    """Lifting a foot is not sliding; only the horizontal component counts."""
+    task = _slip_task(linear=(0.0, 0.0, 0.8), angular=(0.0, 0.0, 0.0))
+    task._update_foot_slip()
+    torch.testing.assert_close(task.foot_slip, torch.zeros(1, 2), atol=1e-6, rtol=0)
+
+
+def test_slip_is_clipped_so_a_crash_cannot_spike_the_observation():
+    """Observations are not normalized here, so an unbounded value reaches the
+    network raw. A crashing robot hits 7.6 m/s against a 0.58 m/s p99."""
+    task = _slip_task(linear=(50.0, 0.0, 0.0), angular=(0.0, 0.0, 0.0))
+    task._update_foot_slip()
+    cap = Go2StandCfg.asset.foot_slip_max
+    torch.testing.assert_close(task.foot_slip, torch.full((1, 2), cap), rtol=0, atol=0)
