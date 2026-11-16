@@ -39,6 +39,31 @@ TARGET_PROJECTED_GRAVITY = [1.0, 0.0, 0.0]
 # same proxy and must not be reused elsewhere.
 HANDSTAND_COM_HEIGHT = 0.5806
 
+# Reduced-order pendulum constants, for the curriculum (go2stand_curriculum.py).
+#
+# HANDSTAND_PENDULUM_LENGTH is NOT HANDSTAND_COM_HEIGHT and the two must not be
+# swapped. The reward measures the centre of mass above the foot body ORIGIN,
+# because that is where the support anchor sits. The pendulum pivots on the
+# contact PLANE, one foot radius lower, so it is 22 mm longer. Using 0.5806
+# here understates the goal energy by 3.5 J.
+#
+# HANDSTAND_INERTIA is measured kinematically, not fitted from a fall: impose a
+# unit rigid rotation about the contact line with the joints locked and read
+# 2*KE off the mass matrix. Fitting a zero-action fall instead gives nonsense,
+# because a position PD at this posture produces zero torque, so the legs sag
+# 6.5 cm before the robot tips -- that trajectory is variable-length, not a
+# rigid rotation, and I_eff = 2*KE/theta_dot^2 blows up while the motion is
+# radial. Curriculum states ARE rigid rotations, so this is the right number
+# for them.
+#
+# Note m*r^2 = 5.91 against I = 6.48: the point-mass form is 9% low, the rear
+# legs being 4.7 kg out at 0.93 m.
+HANDSTAND_MASS = 16.2764
+HANDSTAND_PENDULUM_LENGTH = 0.60262
+HANDSTAND_INERTIA = 6.4796
+# Front-foot contact point, 2.3 mm behind the base origin in the solved pose.
+HANDSTAND_PIVOT_X = -0.00228
+
 # Front legs reach "down" and rear legs "up" along the trunk axis. The calf is
 # at its straightest for both pairs; the thigh angles put the front feet under
 # the CoM and the rear legs as close to the trunk axis as they can get.
@@ -163,6 +188,13 @@ class Go2StandCfg(Go2Cfg):
         # Load-bearing even though _reward_com_height is zero-weighted: it is
         # the pendulum length in the angular-momentum normalizer.
         com_height_target = HANDSTAND_COM_HEIGHT
+
+        # Reduced-order pendulum constants, read by HandstandPendulum.
+        # from_config. No reward uses them.
+        handstand_mass = HANDSTAND_MASS
+        handstand_pendulum_length = HANDSTAND_PENDULUM_LENGTH
+        handstand_inertia = HANDSTAND_INERTIA
+        handstand_pivot_x = HANDSTAND_PIVOT_X
         # Loose, because varying centre-of-mass height is the control authority
         # the reduced-order model is about. 3 cm scores 0.73, 6 cm scores 0.27,
         # folding the legs to 0.30 m bottoms the term out. Not looser than
