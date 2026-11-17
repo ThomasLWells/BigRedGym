@@ -254,8 +254,21 @@ class Go2Stand(Go2):
         foot drift between episodes. Slip is the one proprioceptive-adjacent
         quantity that reveals which world this episode is in.
 
-        Clipped: observations here are not normalized, and a crashing robot
-        reaches 7.6 m/s against an operating range two orders smaller.
+        Gated by foot load, which makes this "sliding while carrying weight"
+        rather than "the contact point is moving". The distinction is not
+        pedantic: a foot in the air has no contact point, but the formula
+        above still evaluates one, and a swinging foot produces a large
+        value. Ungated, the observation saturated its clip for 1% of samples
+        -- 34x the true loaded mean -- so the policy was being told the floor
+        was giving way whenever it picked a foot up.
+
+        The gate is the smoothstep from _foot_load, so an unloaded foot
+        contributes nothing, a lightly loaded one contributes in proportion,
+        and nothing jumps at lift-off.
+
+        Clipped as well: observations here are not normalized, and a crashing
+        robot reaches several m/s against an operating range two orders
+        smaller.
         """
         feet = self.front_feet_indices
         quaternion = self._rigid_body_quat[:, feet]
@@ -269,9 +282,9 @@ class Go2Stand(Go2):
         velocity = self._rigid_body_lin_vel[:, feet] + torch.cross(
             self._rigid_body_ang_vel[:, feet], offset, dim=-1
         )
-        self.foot_slip[:] = torch.norm(velocity[..., :2], dim=-1).clamp(
-            max=self.cfg.asset.foot_slip_max
-        )
+        speed = torch.norm(velocity[..., :2], dim=-1)
+        loaded = self._foot_load(feet, share=0.5)
+        self.foot_slip[:] = (speed * loaded).clamp(max=self.cfg.asset.foot_slip_max)
 
     def _to_support_frame(self, vectors):
         """Express world vectors in the support frame, leaving z alone."""

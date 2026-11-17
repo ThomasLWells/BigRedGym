@@ -57,13 +57,15 @@ CALF_JITTER = 0.03
 # centre -- see Go2Stand._update_foot_slip.
 FOOT_RADIUS = 0.022
 FOOT_SPHERE_OFFSET = [-0.002, 0.0, 0.0]
-# Metres per second past which a slip observation is clipped. Measured over a
-# trained rollout, contact slip runs 0.038 m/s mean and 0.58 m/s at p99, with
-# rare excursions to 7.6 m/s while a robot is already crashing. Clipping at
-# 1.0 keeps the scaled observation bounded near 10 -- the same order as
-# dof_vel's worst case -- without touching the operating range. Observations
-# are not normalized in this task, so an unbounded spike would reach the
-# network raw.
+# Metres per second past which a slip observation is clipped. Observations
+# are not normalized in this task, so an unbounded spike reaches the network
+# raw, and a crashing robot produces several m/s.
+#
+# Measured over a trained rollout, load-gated (see Go2Stand._update_foot_slip):
+# 0.038 m/s mean, 0.085 at p90, 0.647 at p99, with 0.59% of samples reaching
+# this clip. Those remaining clips are genuine -- a foot carrying weight and
+# sliding at a metre per second. Before the gate the p99 sat exactly ON the
+# clip, because an airborne foot was being reported as catastrophic slip.
 FOOT_SLIP_MAX = 1.0
 
 
@@ -267,10 +269,12 @@ class Go2StandCfg(Go2Cfg):
         com_height = HANDSTAND_COM_HEIGHT
         com_offset = 0.1
         com_vel = 0.5
-        # Metres per second per observation unit. Measured contact slip over a
-        # trained rollout: 0.038 mean, 0.093 at p90, 0.58 at p99. At 0.1 a
-        # typical foot reads 0.4 and a real slip event clears 1.0, with the
-        # clip at FOOT_SLIP_MAX bounding it near 10.
+        # Metres per second per observation unit. Load-gated slip over a
+        # trained rollout: median 0.008, mean 0.038, p90 0.085, p99 0.647.
+        # Mostly near zero with a heavy tail, which is what a "something is
+        # wrong" detector should look like. At 0.1 a planted foot reads 0.08,
+        # a real slip event clears 1.0, and FOOT_SLIP_MAX bounds it at 10 --
+        # the same order as dof_vel's worst case.
         foot_slip = 0.1
         # support_momentum is deliberately absent: it is already dimensionless
         # and O(0.5) at the edge of recoverability. get_state only divides when

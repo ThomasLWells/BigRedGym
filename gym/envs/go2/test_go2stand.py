@@ -415,8 +415,12 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     assert not hasattr(weights, "com_height")
 
 
-def _slip_task(linear, angular, quaternion=(0.0, 0.0, 0.0, 1.0)):
-    """A Go2Stand carrying just the two front feet, moving as given."""
+def _slip_task(linear, angular, quaternion=(0.0, 0.0, 0.0, 1.0), load=1.0):
+    """A Go2Stand carrying just the two front feet, moving as given.
+
+    ``load`` is each foot's share of body weight: 1.0 is a fully planted
+    support pair, 0.0 is a foot in the air.
+    """
     task = Go2Stand.__new__(Go2Stand)
     task.cfg = Go2StandCfg()
     task.num_envs = 1
@@ -428,6 +432,11 @@ def _slip_task(linear, angular, quaternion=(0.0, 0.0, 0.0, 1.0)):
     task._rigid_body_quat = torch.tensor([[list(quaternion)] * 2])
     task._rigid_body_lin_vel = torch.tensor([[list(linear)] * 2])
     task._rigid_body_ang_vel = torch.tensor([[list(angular)] * 2])
+    # _foot_load normalizes by share * g * total mass, so with share=0.5 a
+    # foot carrying half of 16 kg reads a full 1.0.
+    task._backend = SimpleNamespace(link_mass=torch.tensor([[8.0, 8.0]]))
+    task.contact_forces = torch.zeros(1, 2, 3)
+    task.contact_forces[0, :, 2] = load * 0.5 * 9.81 * 16.0
     return task
 
 
@@ -471,3 +480,39 @@ def test_slip_is_clipped_so_a_crash_cannot_spike_the_observation():
     task._update_foot_slip()
     cap = Go2StandCfg.asset.foot_slip_max
     torch.testing.assert_close(task.foot_slip, torch.full((1, 2), cap), rtol=0, atol=0)
+
+
+def test_an_airborne_foot_reports_no_slip():
+    """The gate, and the reason it exists.
+
+    A foot in the air has no contact point, but the contact-point formula
+    still evaluates one and a swinging foot produces a large value. Ungated,
+    the observation saturated its clip for 1% of samples at 34x the true
+    loaded mean -- telling the policy the floor was giving way every time it
+    picked a foot up.
+    """
+    airborne = _slip_task(linear=(0.4, 0.0, 0.0), angular=(0.0, 0.0, 0.0), load=0.0)
+    airborne._update_foot_slip()
+    torch.testing.assert_close(airborne.foot_slip, torch.zeros(1, 2), atol=1e-7, rtol=0)
+
+    # The same motion with the foot planted is real slip.
+    planted = _slip_task(linear=(0.4, 0.0, 0.0), angular=(0.0, 0.0, 0.0), load=1.0)
+    planted._update_foot_slip()
+    assert planted.foot_slip[0, 0].item() == pytest.approx(0.4, rel=1e-5)
+
+
+def test_slip_scales_smoothly_with_how_much_weight_the_foot_carries():
+    """A smoothstep gate, so nothing jumps at lift-off -- a hard contact
+    threshold would put a discontinuity in an actor observation."""
+    speeds = [
+        _slip_task(linear=(0.4, 0.0, 0.0), angular=(0.0, 0.0, 0.0), load=f)
+        for f in (0.0, 0.25, 0.5, 0.75, 1.0)
+    ]
+    for task in speeds:
+        task._update_foot_slip()
+    values = [t.foot_slip[0, 0].item() for t in speeds]
+    assert values == sorted(values), "gate must be monotone in load"
+    assert values[0] == pytest.approx(0.0)
+    assert values[-1] == pytest.approx(0.4, rel=1e-5)
+    # Strictly between the ends, not a disguised step function.
+    assert 0.0 < values[2] < 0.4
