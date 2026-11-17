@@ -253,14 +253,22 @@ class Go2StandCfg(Go2Cfg):
         # Yaw has its own tolerance and its own reward term -- see
         # Go2Stand._reward_balance_yaw for why it must not join the norm above.
         #
-        # 0.0075 keeps the term OFF its clamp in the regime the policy actually
-        # occupies, which is what makes its weight a working knob. Measured
-        # |L_z|/N: 0.0006 at reset (e = 0.08) and 0.0129 under exploration-scale
-        # random actions (e = 1.72, short of the e = 3 clamp). A deliberate
-        # 0.3 rad/s pivot costs e = 0.24, 1 rad/s costs e = 0.80. Tighten
-        # toward 0.004 if pivoting survives, but re-measure the exploration
-        # figure first: below ~0.0043 random actions alone saturate it.
-        yaw_momentum_tolerance = 0.0075
+        # Size this against the rate the policy actually turns at, NOT against
+        # exploration noise. An earlier 0.0075 was chosen to stay off the clamp
+        # under untrained random actions, which put its knee at a yaw rate of
+        # 1.24 rad/s while a trained policy wobbles at about 0.15 -- eight
+        # times too loose to charge for the behaviour it exists to stop.
+        #
+        # The drift lesson does not transfer. Drift accumulates monotonically,
+        # so a clamp there is permanent and the term dies. Yaw momentum is a
+        # rate and recovers, so saturating early in training is transient and
+        # survivable.
+        #
+        # At 0.002, against the measured |L_z|/N of a trained policy: median
+        # 0.00026 scores 0.93, p90 0.00082 scores 0.51, p99 0.00153 scores
+        # 0.09. That charges the tail without flattening the middle. For
+        # reference, rate-matching the pitch tolerance would give 0.0031.
+        yaw_momentum_tolerance = 0.002
 
     class scaling(Go2Cfg.scaling):
         # Normalize the observed height by the goal, so the critic sees ~1.0

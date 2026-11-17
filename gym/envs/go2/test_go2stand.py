@@ -331,21 +331,31 @@ def test_yaw_is_costed_by_its_own_term_and_cannot_swamp_the_balance_signal():
     )
 
 
-def test_yaw_tolerance_is_not_saturated_by_exploration_noise():
-    """A term pinned at its clamp is constant, and a constant is invisible to
-    PPO at any weight.
+def test_yaw_tolerance_bites_at_the_rate_the_policy_actually_turns():
+    """Size the tolerance against the operating range, not against noise.
 
-    Yaw momentum under exploration-scale random actions peaks at
-    |L_z|/N = 0.0129, which must stay clear of the e = 3 clamp or the term is
-    inert from the first iteration.
+    An earlier value was chosen to stay off the clamp under untrained random
+    actions. That put its knee at a yaw rate of 1.24 rad/s while a trained
+    policy wobbles at roughly 0.15 -- so the term scored near its ceiling
+    while the robot visibly rotated, and its weight was a dead knob.
+
+    Measured |L_z|/N from a trained rollout, which is what these anchor to.
     """
-    measured_exploration_peak = 0.0129
-    tolerance = Go2StandCfg.reward_settings.yaw_momentum_tolerance
-    assert measured_exploration_peak / tolerance < 3.0
+    median, p90, p99 = 0.00026, 0.00082, 0.00153
 
-    # And it must still be meaningfully negative there, not merely unclamped.
-    hot = _reward_task(momentum=(0.0, 0.0, measured_exploration_peak))
-    assert hot._reward_balance_yaw().item() < -0.2
+    scores = [
+        _reward_task(momentum=(0.0, 0.0, v))._reward_balance_yaw().item()
+        for v in (median, p90, p99)
+    ]
+    assert scores[0] > 0.85, "a quiet robot must not be punished"
+    assert 0.3 < scores[1] < 0.75, "the typical wobble must cost something real"
+    assert scores[2] < 0.3, "the tail must be clearly bad"
+
+    # Early training saturates this, and that is accepted: yaw momentum is a
+    # rate and recovers. Drift, which accumulates, is the case where a clamp
+    # is permanent -- hence _shaped_log_tail there and a plain clamp here.
+    noisy = _reward_task(momentum=(0.0, 0.0, 0.0129))._reward_balance_yaw()
+    assert noisy.item() == pytest.approx(math.exp(-36) - 0.6, abs=1e-6)
 
 
 def test_drift_gradient_survives_many_tolerances_of_displacement():
