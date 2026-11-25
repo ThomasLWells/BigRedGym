@@ -182,17 +182,33 @@ def test_degenerate_foot_separation_does_not_produce_nan():
     assert torch.isfinite(task._support_rot).all()
 
 
+def _gravity_at_lean(radians, axis=2):
+    """projected_gravity for a trunk leaned ``radians`` from the handstand.
+
+    axis 2 is a pitch about the contact line (over the toes), axis 1 a roll
+    along it. At zero this is the target (1, 0, 0), and the chord from the
+    target is 2 sin(radians / 2) either way.
+    """
+    vector = [math.cos(radians), 0.0, 0.0]
+    vector[axis] = math.sin(radians)
+    return tuple(vector)
+
+
 def _reward_task(
     offset=(0.0, 0.0),
     height=HEIGHT,
     momentum=(0.0, 0.0, 0.0),
     drift=0.0,
     com_vel=(0.0, 0.0, 0.0),
+    gravity=None,
 ):
     task = Go2Stand.__new__(Go2Stand)
     task.cfg = Go2StandCfg()
     task.num_envs = 1
     task.device = "cpu"
+    target = Go2StandCfg.reward_settings.target_projected_gravity
+    task._target_projected_gravity = torch.tensor([target])
+    task.projected_gravity = torch.tensor([list(gravity if gravity else target)])
     task.com_offset = torch.tensor([list(offset)])
     task.com_height = torch.tensor([[height]])
     task.com_vel = torch.tensor([list(com_vel)])
@@ -214,6 +230,7 @@ def test_every_reward_peaks_at_exactly_one_at_the_goal():
         task._reward_com_vel_xy,
         task._reward_front_feet_drift,
         task._reward_balance_yaw,
+        task._reward_balance_attitude,
         task._reward_balance_alive,
     ):
         assert reward().item() == pytest.approx(1.0)
@@ -401,11 +418,12 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
         momentum=(100.0, 0.0, 100.0),
         drift=100.0,
         com_vel=(100.0, 0.0, 0.0),
+        gravity=(-1.0, 0.0, 0.0),  # fully inverted: the largest chord there is
     )
     # One shaping function, so one floor: the e = 40 guard of the logarithmic
-    # tail, reached here by every term at once.
+    # tail, reached here by every unbounded term at once.
     floor = math.exp(-4 * 40.0**2) - 0.2 * math.log1p(40.0)
-    shaped = (
+    unbounded = (
         "balance_momentum",
         "balance_offset",
         "com_height",
@@ -413,10 +431,20 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
         "balance_yaw",
         "front_feet_drift",
     )
-    for name in shaped:
+    for name in unbounded:
         assert getattr(far, f"_reward_{name}")().item() == pytest.approx(
             floor, abs=1e-6
         )
+
+    # balance_attitude is the exception and has its OWN floor: its argument is
+    # a chord on the unit sphere, so it cannot exceed 2.0 however badly the
+    # robot is oriented, and it bottoms well above the e = 40 guard.
+    worst_chord = 2.0 / Go2StandCfg.reward_settings.attitude_tolerance
+    attitude_floor = math.exp(-4 * worst_chord**2) - 0.2 * math.log1p(worst_chord)
+    assert far._reward_balance_attitude().item() == pytest.approx(
+        attitude_floor, abs=1e-6
+    )
+    assert attitude_floor > floor, "the chord bound must be the binding one"
 
     # The alive bonus must outweigh every floor at once, or the per-step
     # total goes negative and terminating becomes the cheaper option.
@@ -424,8 +452,10 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     # it does not enter. Summed from the config rather than hardcoded, so
     # adding a term or retuning a weight fails here rather than in a GPU run.
     weights = Go2StandRunnerCfg().critic.reward.weights
-    worst = floor * sum(
-        getattr(weights, name) for name in shaped if hasattr(weights, name)
+    worst = (
+        floor
+        * sum(getattr(weights, name) for name in unbounded if hasattr(weights, name))
+        + attitude_floor * weights.balance_attitude
     )
     assert weights.balance_alive + worst > 0.0
     # com_height is off: an absent key, not a zero, because this weights class
@@ -534,3 +564,101 @@ def test_slip_scales_smoothly_with_how_much_weight_the_foot_carries():
     assert values[-1] == pytest.approx(0.4, rel=1e-5)
     # Strictly between the ends, not a disguised step function.
     assert 0.0 < values[2] < 0.4
+
+
+# ------------ attitude ----------------
+
+
+def test_only_the_attitude_term_can_tell_a_handstand_from_a_lean():
+    """The regression test for the bug this term exists to fix.
+
+    A robot standing MOTIONLESS at 15 degrees of lean, with its mass arranged
+    so the centre of mass sits over the contact line, is indistinguishable
+    from a handstand to every reduced-order term: all the velocities are zero
+    so the momentum vanishes, and the offset vanishes by construction. A
+    policy trained 5000 iterations without an attitude term found exactly
+    that pose and held it 99.2% of the time.
+
+    (front_feet_support is not exercised here -- it needs contact forces the
+    fixture does not build -- but it too is at ceiling for a planted robot.)
+    """
+    lean = _reward_task(gravity=_gravity_at_lean(math.radians(15.0)))
+
+    for blind in (
+        lean._reward_balance_momentum,
+        lean._reward_balance_offset,
+        lean._reward_com_vel_xy,
+        lean._reward_balance_yaw,
+        lean._reward_front_feet_drift,
+    ):
+        assert blind().item() == pytest.approx(1.0), (
+            "a reduced-order term noticed a lean it cannot see"
+        )
+
+    assert lean._reward_balance_attitude().item() < 0.0, (
+        "the attitude term must price the lean every other term misses"
+    )
+
+    # And the weighted totals must now differ, which is the whole point.
+    weights = Go2StandRunnerCfg().critic.reward.weights
+    upright = _reward_task()
+    assert (
+        weights.balance_attitude * lean._reward_balance_attitude().item()
+        < weights.balance_attitude * upright._reward_balance_attitude().item()
+    )
+
+
+def test_attitude_is_blind_to_rotation_about_the_gravity_axis():
+    """Spinning about the trunk's own long axis leaves projected gravity at
+    the target, so this term must read exactly 1.0 -- yaw is balance_yaw's
+    job and the two must not double-charge the same mode."""
+    spun = _reward_task(gravity=(1.0, 0.0, 0.0))
+    assert spun._reward_balance_attitude().item() == pytest.approx(1.0)
+
+
+def test_attitude_is_sign_symmetric_and_isotropic():
+    """Over the toes and over the heels cost the same, and so does the same
+    tilt sideways: the term is a pose measure, not a balance measure, and a
+    handstand leaning left is as wrong as one leaning forward."""
+    angle = math.radians(8.0)
+    scores = [
+        _reward_task(gravity=_gravity_at_lean(s * angle, axis=a))
+        ._reward_balance_attitude()
+        .item()
+        for a in (1, 2)
+        for s in (1.0, -1.0)
+    ]
+    assert max(scores) - min(scores) < 1e-6
+
+
+def test_attitude_does_not_constrain_centre_of_mass_height():
+    """Height is the control authority the reduced-order model is about, which
+    is why com_height is unweighted. This term is a function of projected
+    gravity alone, so it must be flat in height."""
+    scores = {
+        height: _reward_task(height=height)._reward_balance_attitude().item()
+        for height in (0.30, 0.45, HEIGHT, 0.62)
+    }
+    assert max(scores.values()) - min(scores.values()) < 1e-9
+
+
+def test_attitude_tolerance_bites_at_the_lean_the_policy_actually_held():
+    """Calibration, anchored on measurement rather than taste.
+
+    The policy trained without this term held a median 15.1 degrees of lean
+    and was within 5 degrees of vertical 0.8% of the time. The tolerance is
+    sized so that a tight hold is near ceiling, the measured lean is clearly
+    negative, and the band between them carries real gradient.
+    """
+    score = lambda d: (  # noqa: E731
+        _reward_task(gravity=_gravity_at_lean(math.radians(d)))
+        ._reward_balance_attitude()
+        .item()
+    )
+
+    assert score(1.0) > 0.75, "a tight handstand must sit near ceiling"
+    assert 0.3 < score(2.0) < 0.6, "the near field must carry the precision"
+    assert score(15.1) < -0.2, "the measured lean must be clearly bad"
+    # Monotone, and still pushing at the lean it has to escape from.
+    assert score(5.0) > score(10.0) > score(15.1) > score(25.0)
+    assert score(10.0) - score(20.0) > 0.05, "the tail must still pull it in"

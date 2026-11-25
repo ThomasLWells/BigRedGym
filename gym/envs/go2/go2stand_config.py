@@ -276,6 +276,22 @@ class Go2StandCfg(Go2Cfg):
         # 0.6 sits in the dead band and the stage does not move.
         promote_rate = 0.8
         demote_rate = 0.4
+        # Surviving the horizon is NOT success on its own -- that is the
+        # criterion that promoted a leaning policy through fifteen stages. The
+        # episode must also have HELD the handstand: mean attitude error over
+        # the scored span, in chord units, at most this. 0.15 is 8.6 degrees
+        # of time-averaged tilt; the policy measured at a steady 15 degree
+        # lean reads 0.26 and fails.
+        #
+        # Averaged over the TAIL of the episode, not all of it. The robot
+        # spawns at the stage's lean cap -- 21 degrees at stage 13, 34 at
+        # stage 18 -- so a whole-episode mean charges every stage for its own
+        # spawn transient, and charges the hard stages most. The tail is
+        # stage-independent and asks the right question: a recovery that takes
+        # five seconds is not a handstand.
+        hold_attitude_error = 0.15
+        hold_fraction = 0.5
+
         # There is deliberately no "N consecutive reviews" rule. A window is
         # one unbiased sample of the whole population, so at 4096 envs its
         # standard error is sqrt(0.25/4096) = 0.008 and the dead band above is
@@ -295,6 +311,22 @@ class Go2StandCfg(Go2Cfg):
         # of mass instead.
         base_height_target = HANDSTAND_HEIGHT
         target_projected_gravity = TARGET_PROJECTED_GRAVITY
+        # Chord on the unit sphere per error unit of attitude: projected
+        # gravity is a unit vector, so a lean of phi costs 2 sin(phi/2). This
+        # is 2 sin(2.5 deg), i.e. ONE ERROR UNIT AT 5 DEGREES OF LEAN.
+        #
+        # Deliberately tight, and sharper than it looks: _sqrdexp is
+        # exp(-4 e^2), so the term is nearly dead by one tolerance -- 2 deg
+        # scores 0.46 and 5 deg is already slightly negative. That is what
+        # buys a crisp handstand rather than a merely survivable one, and it
+        # matches the convention elsewhere here (foot drift scores 0.46 at
+        # 2 cm against a 5 cm tolerance). For a 5 deg lean to be roughly
+        # neutral instead, this wants to be about 0.21.
+        #
+        # The tolerance governs the FINISH, not the escape from a lean: the
+        # gain from 15 deg to vertical is 1.28 per unit weight here and 1.13
+        # at 0.21. The weight is the knob for the escape.
+        attitude_tolerance = 0.0872
 
         # Load-bearing even though _reward_com_height is zero-weighted: it is
         # the pendulum length in the angular-momentum normalizer.
@@ -473,7 +505,7 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # Every term is a bare scalar with ceiling 1.0, so the logged
                 # per-second average of each approaches its own weight at the
                 # goal and a glance says how close the policy is. Goal total
-                # 16.5.
+                # 22.5.
                 #
                 # The first three are pure functions of the reduced-order
                 # state and name no joint, foot or posture, so the policy
@@ -481,6 +513,16 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 balance_momentum = 3.0
                 balance_offset = 2.0
                 com_vel_xy = 1.0
+                # NOT a reduced-order term despite the prefix -- it names the
+                # trunk. It exists because the reduced-order state cannot see
+                # a lean: the rear legs are exactly the redundancy that puts
+                # the centre of mass over the contact line at ANY trunk angle,
+                # so a motionless 15 degree lean scored the full goal total
+                # and a policy trained for 5000 iterations learned precisely
+                # that. Weighted level with balance_momentum because being
+                # upright is what makes the pose a handstand rather than
+                # merely a balance.
+                balance_attitude = 3.0
                 # The pivot tracks the live feet, so the balance terms do not
                 # notice a foot sliding; these charge for foot motion directly
                 # instead of corrupting the balance signal with it. Support
@@ -497,21 +539,30 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # only gradient available to an untrained policy points at
                 # falling faster.
                 #
-                # Every shaped term shares the one logarithmic tail and so
-                # floors at -0.743, giving the constraint
+                # Every shaped term shares the one logarithmic tail, so each
+                # floors at -0.743 -- EXCEPT balance_attitude, whose argument
+                # is a chord on the unit sphere and so cannot exceed 2.0. Its
+                # error tops out at 2.0 / 0.0872 = 22.9 and it bottoms at
+                # -0.635, not -0.743. The constraint is therefore
                 #
                 #     balance_alive >= 0.743 * (balance_momentum
                 #                               + balance_offset + com_vel_xy
                 #                               + balance_yaw
                 #                               + front_feet_drift)
+                #                      + 0.635 * balance_attitude
                 #
-                # Here 0.743 * 9 = 6.687, against 7.0 -> worst case +0.31.
-                # (front_feet_support is a smoothstep in [0, 1] and cannot go
-                # negative, so it never enters.)
+                # Here 0.743 * 9 + 0.635 * 3 = 8.59, against 9.0 -> worst case
+                # +0.41. (front_feet_support is a smoothstep in [0, 1] and
+                # cannot go negative, so it never enters.)
+                #
+                # Raised from 7.0 with balance_attitude. Note the ratio to the
+                # shaped sum is preserved -- 7.0/17.5 and 9.0/22.5 are both
+                # 40% -- so the relative value of surviving versus balancing
+                # well has not moved.
                 #
                 # RAISE THIS IF YOU RAISE ANY OF THOSE WEIGHTS. A test asserts
                 # the inequality; a GPU run would not.
-                balance_alive = 7.0
+                balance_alive = 9.0
 
             class termination_weight:
                 # The terminal reward is -weight * dt, so this is tiny by

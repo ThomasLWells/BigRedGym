@@ -44,15 +44,31 @@ def _curriculum_task(num_envs=100):
     task.curriculum_window_rate = 0.0
     task.curriculum_reviews = 0
     task.curriculum_review_episodes = 0.0
+    task.curriculum_survival_rate = 0.0
+    task.curriculum_hold_error = 0.0
     task._window_successes = 0.0
+    task._window_survivals = 0.0
+    task._window_hold_error = 0.0
     task._window_episodes = 0.0
     task._curriculum_stage_step = 0
     task.common_step_counter = 0
+    task.max_episode_length = float(HORIZON)
+    task._hold_start_step = int(
+        math.ceil((1.0 - task.cfg.curriculum.hold_fraction) * HORIZON)
+    )
     task.timed_out = torch.zeros(num_envs, dtype=torch.bool)
     task.terminated = torch.zeros(num_envs, dtype=torch.bool)
     task.episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
     task._curriculum_fresh = torch.zeros(num_envs, dtype=torch.bool)
     task._curriculum_reported = torch.zeros(num_envs, dtype=torch.bool)
+    task.projected_gravity = torch.tensor(
+        [Go2StandCfg.reward_settings.target_projected_gravity]
+    ).repeat(num_envs, 1)
+    task._target_projected_gravity = torch.tensor(
+        [Go2StandCfg.reward_settings.target_projected_gravity]
+    )
+    task._hold_error_sum = torch.zeros(num_envs, dtype=torch.float)
+    task._hold_error_steps = torch.zeros(num_envs, dtype=torch.float)
     task._apply_curriculum_stage()
     return task
 
@@ -60,10 +76,29 @@ def _curriculum_task(num_envs=100):
 # Steps the real runner advances each env by per iteration: num_steps_per_env
 # (rollout_size / num_envs = 8) times n_policy_steps (1 at a 100 Hz actor).
 STEPS_PER_ITERATION = 8
+# Control steps in an episode, matching episode_length_s / ctrl_dt.
+HORIZON = 1000
+# A hold error comfortably inside cfg.curriculum.hold_attitude_error. The
+# drivers default to this so that tests written about the SURVIVAL half of the
+# criterion keep testing what they were written to test -- left at zero the
+# hold check would read 0 <= 0 and pass vacuously, which is worse than failing.
+HELD = 0.02
+
+
+def _set_hold(task, error):
+    """Give every env a scored tail averaging ``error`` of attitude chord."""
+    steps = HORIZON - task._hold_start_step
+    task._hold_error_steps.fill_(float(steps))
+    task._hold_error_sum.fill_(float(error) * steps)
 
 
 def _finish_episodes(
-    task, episodes, success_fraction, also_terminate=False, steps=STEPS_PER_ITERATION
+    task,
+    episodes,
+    success_fraction,
+    also_terminate=False,
+    steps=STEPS_PER_ITERATION,
+    hold_error=HELD,
 ):
     """Retire whole batches of episodes at a fixed success rate.
 
@@ -77,6 +112,7 @@ def _finish_episodes(
     for _ in range(episodes // task.num_envs):
         task.common_step_counter += steps
         task.episode_length_buf.fill_(100)
+        _set_hold(task, hold_error)
         task.timed_out[:] = torch.arange(task.num_envs) < wins
         task.terminated[:] = (
             torch.ones(task.num_envs, dtype=torch.bool)
@@ -89,7 +125,7 @@ def _finish_episodes(
         task._curriculum_fresh |= mask
 
 
-def _run_reviews(task, reviews, success_fraction, limit=5000):
+def _run_reviews(task, reviews, success_fraction, limit=5000, hold_error=HELD):
     """Drive the task until ``reviews`` more reviews have fired.
 
     Tests say how many REVIEWS they want rather than how many episodes,
@@ -100,11 +136,19 @@ def _run_reviews(task, reviews, success_fraction, limit=5000):
     for _ in range(limit):
         if task.curriculum_reviews >= target:
             return
-        _finish_episodes(task, task.num_envs, success_fraction)
+        _finish_episodes(task, task.num_envs, success_fraction, hold_error=hold_error)
     raise AssertionError(f"only {task.curriculum_reviews} reviews fired, want {target}")
 
 
-def _run_realistic(task, iterations, success_rate, horizon=1000, fail_steps=50, seed=0):
+def _run_realistic(
+    task,
+    iterations,
+    success_rate,
+    horizon=HORIZON,
+    fail_steps=50,
+    seed=0,
+    hold_error=HELD,
+):
     """Drive the gate with episodes whose LENGTH depends on their outcome.
 
     The simple driver above retires every env on the same step, which cannot
@@ -124,6 +168,7 @@ def _run_realistic(task, iterations, success_rate, horizon=1000, fail_steps=50, 
             phase += 1
             done = phase >= torch.where(holds, horizon, fail_steps)
             task.episode_length_buf = phase.clone()
+            _set_hold(task, hold_error)
             task.timed_out[:] = done & holds
             task.terminated[:] = done & ~holds
             seen = task.curriculum_reviews
@@ -570,3 +615,101 @@ def test_stage_moves_one_at_a_time_and_stops_at_the_last():
     task.curriculum_stage = 0
     task._apply_curriculum_stage()
     assert task._max_attitude_error == loosest, "the threshold tightened on demotion"
+
+
+# ------------ the hold criterion ----------------
+
+
+def test_a_motionless_lean_is_not_a_solved_stage():
+    """The gate's counterpart to the attitude reward, and the direct
+    regression for how a leaning policy climbed fifteen stages.
+
+    Episodes that time out, never terminate, and carry a mean attitude error
+    above the threshold are survivals but not successes. The two logged rates
+    must disagree, and that disagreement is exactly "what fraction of this
+    policy's success is leaning".
+    """
+    leaning = 2.0 * math.sin(math.radians(15.0) / 2.0)  # the measured pose
+    assert leaning > Go2StandCfg.curriculum.hold_attitude_error
+
+    task = _curriculum_task()
+    _run_reviews(task, 1, success_fraction=1.0, hold_error=leaning)
+
+    assert task.curriculum_survival_rate == pytest.approx(1.0), (
+        "every episode did survive -- that is the point"
+    )
+    assert task.curriculum_window_rate == pytest.approx(0.0), (
+        "a leaning episode must not count as a solved stage"
+    )
+    assert task.curriculum_stage == 0, "promoted a policy that was only leaning"
+    assert task.curriculum_hold_error == pytest.approx(leaning, abs=1e-5)
+
+
+def test_an_upright_hold_still_passes():
+    """The other half: tightening the gate must not make it unpassable."""
+    task = _curriculum_task()
+    upright = 2.0 * math.sin(math.radians(2.0) / 2.0)
+    assert upright < Go2StandCfg.curriculum.hold_attitude_error
+
+    _run_reviews(task, 1, success_fraction=1.0, hold_error=upright)
+    assert task.curriculum_window_rate == pytest.approx(1.0)
+    assert task.curriculum_stage == 1
+
+
+def test_the_hold_accumulator_only_scores_the_tail():
+    """Drive the real accumulator over a synthetic episode: leaning for the
+    first half, upright for the second. Only the second half may count."""
+    task = _curriculum_task(num_envs=4)
+    lean = math.radians(20.0)
+
+    for step in range(1, HORIZON + 1):
+        # Strictly before the first scored step, so the tail is pure.
+        angle = lean if step < task._hold_start_step else 0.0
+        task.episode_length_buf.fill_(step)
+        task.projected_gravity[:] = torch.tensor(
+            [[math.cos(angle), 0.0, math.sin(angle)]]
+        ).repeat(task.num_envs, 1)
+        task._accumulate_hold_quality()
+
+    assert task._hold_error_steps[0].item() == pytest.approx(
+        HORIZON - task._hold_start_step + 1
+    )
+    # The leaning half is excluded entirely, so the mean is the upright half.
+    mean = (task._hold_error_sum[0] / task._hold_error_steps[0]).item()
+    assert mean == pytest.approx(0.0, abs=1e-6), (
+        "the spawn transient leaked into the scored tail"
+    )
+
+
+def test_the_hold_criterion_fails_a_late_drift():
+    """Upright early and leaning late must fail: the tail is what is scored,
+    so drifting away at the end is exactly what it should catch."""
+    task = _curriculum_task(num_envs=4)
+    drift = math.radians(20.0)
+
+    for step in range(1, HORIZON + 1):
+        angle = 0.0 if step <= 3 * HORIZON // 4 else drift
+        task.episode_length_buf.fill_(step)
+        task.projected_gravity[:] = torch.tensor(
+            [[math.cos(angle), 0.0, math.sin(angle)]]
+        ).repeat(task.num_envs, 1)
+        task._accumulate_hold_quality()
+
+    mean = (task._hold_error_sum[0] / task._hold_error_steps[0]).item()
+    assert mean > Go2StandCfg.curriculum.hold_attitude_error, (
+        "a policy that drifts off in the last quarter must not pass"
+    )
+
+
+def test_the_hold_accumulator_is_cleared_on_reset():
+    """Otherwise a failed episode's lean leaks into the next one and the gate
+    becomes a random walk over stale evidence."""
+    task = _curriculum_task(num_envs=4)
+    _set_hold(task, 0.5)
+    assert task._hold_error_sum[0] > 0.0
+
+    mask = torch.ones(task.num_envs, dtype=torch.bool)
+    task._hold_error_sum.masked_fill_(mask, 0.0)
+    task._hold_error_steps.masked_fill_(mask, 0.0)
+    assert task._hold_error_sum.sum().item() == 0.0
+    assert task._hold_error_steps.sum().item() == 0.0

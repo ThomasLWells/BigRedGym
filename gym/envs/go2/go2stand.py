@@ -19,9 +19,20 @@ _reward_front_feet_drift bounds pdot, which bounds that error.
 
 Three terms are functions of the reduced-order state alone -- momentum, offset,
 horizontal centre-of-mass speed -- and name no joint, foot or posture, so the
-policy is free to choose *how* it balances. Two foot terms and a yaw term cover
-what the model cannot see, and a constant alive bonus keeps the per-step total
-positive.
+policy is free to choose *how* it balances. Two foot terms, a yaw term and an
+attitude term cover what the model cannot see, and a constant alive bonus keeps
+the per-step total positive.
+
+The attitude term is there because the identity above is blind to a lean. It
+pins where the centre of mass sits relative to the contact line and says
+nothing about the orientation of the trunk carrying it. On a rigid pendulum
+those coincide; on a twelve-joint robot the rear legs are exactly the
+redundancy that satisfies the centre-of-mass condition at ANY trunk angle, so
+a motionless lean scores the full goal total. A policy trained without it
+learned precisely that, holding a 15 degree lean 99.2% of the time. The term
+is a posture preference the reduced-order model does not have, and it is
+deliberately on the trunk rather than on any joint -- naming the rear legs
+would kill the flywheel the task exists to study.
 
 Two things are deliberately uncosted. Vertical centre-of-mass motion, because
 raising and lowering the centre of mass is the authority the paper studies and
@@ -55,11 +66,21 @@ class Go2Stand(Go2):
     # review_episodes is a self-check on the gate itself: it should read about
     # cfg.curriculum.review_episodes, and a much larger number means episodes
     # are arriving in bursts far bigger than the rollout budget implies.
+    # curriculum_hold_error is the headline for a run: the mean attitude error
+    # of the episodes that SURVIVED, in chord units, directly comparable to
+    # cfg.curriculum.hold_attitude_error. Read it next to
+    # curriculum_survival_rate -- with no survivors it reads 0.0, which is the
+    # empty mean and not a perfectly upright robot. And the gap between
+    # curriculum_survival_rate (the OLD criterion, survival alone) and
+    # curriculum_window_rate (survival AND upright) is literally what fraction
+    # of this policy's success is leaning.
     log_categories = {
         "stand": [
             "curriculum_stage",
             "curriculum_stage_max",
             "curriculum_window_rate",
+            "curriculum_survival_rate",
+            "curriculum_hold_error",
             "curriculum_reviews",
             "curriculum_review_episodes",
         ]
@@ -184,17 +205,15 @@ class Go2Stand(Go2):
         self.curriculum_stage = 0
         self.curriculum_stage_max = 0
         self.curriculum_window_rate = 0.0
+        self.curriculum_survival_rate = 0.0
+        self.curriculum_hold_error = 0.0
         self.curriculum_reviews = 0
         self.curriculum_review_episodes = 0.0
         self._window_successes = 0.0
+        self._window_survivals = 0.0
+        self._window_hold_error = 0.0
         self._window_episodes = 0.0
         self._curriculum_stage_step = 0
-        # Which stage each env's CURRENT episode began under. A demotion
-        # tightens the attitude termination, so envs already past the new
-        # threshold terminate at once; counting those against the new stage
-        # would depress its first window and demote again, cascading to zero.
-        # Scoring only episodes that started here is also just the honest
-        # statistic -- a window should measure the stage it claims to.
         # A window samples each env's first episode to START after the window
         # opened: `fresh` marks an env that has begun such an episode and
         # `reported` one that has already contributed. See _score_curriculum
@@ -204,6 +223,23 @@ class Go2Stand(Go2):
         )
         self._curriculum_reported = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
+        )
+        # Attitude error accumulated over the scored TAIL of each episode, and
+        # the number of steps in it. Surviving the horizon is not evidence of
+        # a handstand; this is what turns it into evidence. See
+        # _accumulate_hold_quality.
+        self._hold_error_sum = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+        self._hold_error_steps = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+        # max_episode_length comes from _parse_cfg, which LeggedRobot.__init__
+        # runs before _init_buffers; it is a float from np.ceil.
+        self._hold_start_step = int(
+            math.ceil(
+                (1.0 - self.cfg.curriculum.hold_fraction) * self.max_episode_length
+            )
         )
         self._apply_curriculum_stage()
 
@@ -239,14 +275,26 @@ class Go2Stand(Go2):
             self._pendulum.lean_cap,
         )
         # Driven by the HIGH-WATER mark, so the threshold only ever loosens.
-        # If it tracked the live stage, a demotion would tighten it and every
-        # env sitting between the old and new values would terminate on the
-        # next step -- collecting a termination penalty and a truncated return
-        # for a fall that never happened, at every demotion, for a large
-        # fraction of the envs. The attitude check is a sample-efficiency gate
-        # and no reward term mentions attitude, so there is nothing to buy by
-        # tightening it back down. Worst case it sits 36% above the configured
-        # value, which only ever costs a few extra samples per episode.
+        # If it tracked the live stage, a demotion would tighten it and envs
+        # sitting between the old and new values would terminate on the next
+        # step -- a termination penalty and a truncated return for a fall that
+        # never happened.
+        #
+        # REVISIT THIS. Its original justification was that no reward term
+        # mentioned attitude, so there was nothing to buy by tightening back
+        # down. _reward_balance_attitude deletes that premise: the termination
+        # and the reward are now two statements about the same quantity, and
+        # this lets them disagree by 36%. One excursion to stage 15 pinned the
+        # threshold at 40.8 degrees of permitted lean for the rest of a 5000
+        # iteration run. It is kept for now only because the reward, not the
+        # termination, is meant to hold the pose -- if the policy still leans,
+        # tightening this is the next lever.
+        #
+        # The cost of reverting is also smaller than this comment used to
+        # imply: termination_margin is 0.25 rad against a largest one-stage
+        # lean step of 0.0436, so a one-stage demotion cannot kill a freshly
+        # spawned env at any stage -- only envs already past 34 degrees, which
+        # are overwhelmingly falling anyway.
         widest = self._curriculum_schedule[self.curriculum_stage_max]
         allowed = min(
             min(self._pendulum.max_lean_at_rest(widest), self._pendulum.lean_cap)
@@ -273,6 +321,8 @@ class Go2Stand(Go2):
         window opened and are not part of its sample.
         """
         self._window_successes = 0.0
+        self._window_survivals = 0.0
+        self._window_hold_error = 0.0
         self._window_episodes = 0.0
         self._curriculum_fresh.fill_(False)
         self._curriculum_reported.fill_(False)
@@ -282,9 +332,16 @@ class Go2Stand(Go2):
         """Review the stage periodically and move it up or down.
 
         Called at the TOP of ``_reset_idx``, for two reasons: the flags, the
-        episode counter and the per-env stage stamp are still those of the
+        episode counter and the hold accumulators are still those of the
         episode that just ended, and a stage change then takes effect on the
         very envs resetting on this step rather than a policy step later.
+
+        A stage is solved when episodes **survive the horizon AND hold the
+        handstand** -- see the `held` conjunct below. Survival alone was the
+        original criterion and it is what certified a policy that balanced at
+        a steady 15 degree lean through fifteen stages, because a motionless
+        lean survives indefinitely. Both rates are logged, and the gap between
+        them is what fraction of the policy's success is leaning.
 
         A *review* rather than a running average. The previous version kept an
         EMA that was reset to zero on every promotion, which made its own rise
@@ -334,8 +391,27 @@ class Go2Stand(Go2):
             # clears terminated when the horizon fires -- so a fall on the last
             # step of an episode has both set, and gating on the timeout alone
             # would score it a success.
-            self._window_successes += float(
-                (finished & self.timed_out & ~self.terminated).sum()
+            survived = finished & self.timed_out & ~self.terminated
+            # ...and surviving is still not succeeding. A motionless lean
+            # survives indefinitely, which is how a policy holding 15 degrees
+            # was promoted through fifteen stages. The episode must also have
+            # HELD the pose: mean attitude error over the scored tail, within
+            # cfg.curriculum.hold_attitude_error.
+            #
+            # Multiplied through rather than divided, so there is no
+            # divide-by-zero to guard. The degenerate steps == 0 case reads
+            # 0 <= 0 and passes, which is unreachable: an episode that never
+            # got past the halfway mark cannot have timed out.
+            held = self._hold_error_sum <= (
+                self.cfg.curriculum.hold_attitude_error * self._hold_error_steps
+            )
+            self._window_successes += float((survived & held).sum())
+            self._window_survivals += float(survived.sum())
+            self._window_hold_error += float(
+                (
+                    self._hold_error_sum[survived]
+                    / self._hold_error_steps[survived].clamp(min=1.0)
+                ).sum()
             )
             self._window_episodes += count
             self._curriculum_reported |= finished
@@ -349,6 +425,10 @@ class Go2Stand(Go2):
             return
 
         self.curriculum_window_rate = self._window_successes / self._window_episodes
+        self.curriculum_survival_rate = self._window_survivals / self._window_episodes
+        self.curriculum_hold_error = self._window_hold_error / max(
+            self._window_survivals, 1.0
+        )
         self.curriculum_reviews += 1
         self.curriculum_review_episodes = self._window_episodes
         self._open_window()
@@ -401,6 +481,11 @@ class Go2Stand(Go2):
         # which is what keeps a window's sample to episodes spawned under the
         # stage it is judging.
         self._curriculum_fresh |= reset_mask
+        # Same ordering: _score_curriculum has already read these for the
+        # episode that just ended. Without the clear, a failed episode's lean
+        # leaks into the next one and the hold criterion becomes a random walk.
+        self._hold_error_sum.masked_fill_(reset_mask, 0.0)
+        self._hold_error_steps.masked_fill_(reset_mask, 0.0)
         # dof_pos_target is a residual that _compute_torques adds
         # default_dof_pos to, and LeggedRobot._reset_idx seeds it *with*
         # default_dof_pos -- which would make the PD target twice the support
@@ -437,21 +522,65 @@ class Go2Stand(Go2):
         self._update_support_frame()
         self._update_reduced_order_state()
         self._update_foot_slip()
+        self._accumulate_hold_quality()
+
+    def _accumulate_hold_quality(self):
+        """Average the attitude error over the tail of each episode.
+
+        The curriculum's evidence that a stage is actually solved. super()
+        has already incremented episode_length_buf and refreshed
+        projected_gravity, so this reads post-step attitude against a 1-based
+        step index.
+
+        Only the tail counts. The robot SPAWNS at the stage's lean cap -- 21
+        degrees at stage 13, 34 at stage 18 -- so averaging the whole episode
+        would charge each stage for its own spawn transient, and charge the
+        hard stages most. Scoring the tail is stage-independent and asks the
+        question that matters: a recovery that takes five seconds is not a
+        handstand.
+        """
+        scoring = (self.episode_length_buf >= self._hold_start_step).float()
+        self._hold_error_sum += self._attitude_error() * scoring
+        self._hold_error_steps += scoring
+
+    def _attitude_error(self):
+        """Chord on the unit sphere between the trunk's gravity direction and
+        the handstand's.
+
+        One definition for the reward, the termination and the curriculum's
+        hold criterion, so the three cannot drift apart. A lean of phi reads
+        2 sin(phi/2): 0.0872 at 5 degrees, 0.2611 at 15, 0.600 at 34.9.
+        """
+        return torch.norm(
+            self.projected_gravity - self._target_projected_gravity, dim=1
+        )
 
     def _check_terminations_and_timeouts(self):
         super()._check_terminations_and_timeouts()
         # End the episode once the attitude is past recovery. The inherited
         # check only fires when the trunk touches down, long after the fall is
         # decided, so without this most of the rollout samples a robot that is
-        # already on the ground. A sample-efficiency gate, not a shaping term:
-        # no reward mentions attitude.
-        attitude_error = torch.norm(
-            self.projected_gravity - self._target_projected_gravity, dim=1
-        )
+        # already on the ground. A sample-efficiency gate, deliberately far
+        # looser than _reward_balance_attitude, which is what actually holds
+        # the pose upright.
+        #
         # Stage-dependent, not the raw config value -- see
-        # _apply_curriculum_stage. Equal to it for every stage up to roughly
-        # 20 degrees of lean.
-        self.terminated |= attitude_error > self._max_attitude_error
+        # _apply_curriculum_stage.
+        self.terminated |= self._attitude_error() > self._max_attitude_error
+
+    def _reward_orientation(self):
+        """Inherited from Go2 and WRONG here -- refuse it rather than let it
+        be reached for.
+
+        Go2's version rewards a FLAT base, so in a handstand it is maximized
+        by lying down: it would pay the policy to fall over. It is unweighted
+        today, but adding a correctly-targeted attitude term makes this the
+        obvious thing for a future reader to enable.
+        """
+        raise NotImplementedError(
+            "Go2._reward_orientation targets a flat base and rewards falling "
+            "over in a handstand; use balance_attitude instead."
+        )
 
     def _prefix_subset(self, names, prefixes):
         """Positions in ``names`` whose entry starts with one of ``prefixes``."""
@@ -650,13 +779,18 @@ class Go2Stand(Go2):
         """Constant, and the only term that is not about the pendulum.
 
         Sized so the per-step total stays strictly positive everywhere in the
-        reachable state space. Every shaped term now shares the one
-        logarithmic tail and so bottoms out at -0.743, giving a floor of
-        -0.743 * (3 + 2 + 1 + 1 + 2) = -6.69 weighted against this term's 7.0
-        (front_feet_support is a smoothstep in [0, 1] and cannot go negative).
-        The constraint to preserve when retuning:
+        reachable state space. Every shaped term shares the one logarithmic
+        tail and so bottoms out at -0.743 -- except balance_attitude, whose
+        argument is a chord on the unit sphere and therefore cannot exceed
+        2.0, capping its error at 22.9 and its floor at -0.635. So
 
-            balance_alive >= 0.743 * sum(shaped term weights)
+            floor = -0.743 * (3 + 2 + 1 + 1 + 2) + -0.635 * 3 = -8.59
+
+        against this term's 9.0 (front_feet_support is a smoothstep in [0, 1]
+        and cannot go negative). The constraint to preserve when retuning:
+
+            balance_alive >= 0.743 * sum(unbounded shaped weights)
+                             + 0.635 * balance_attitude
 
         Being constant, it says nothing about *how* to balance, so it adds no
         shaping of its own.
@@ -701,6 +835,41 @@ class Go2Stand(Go2):
             self.support_momentum[:, 2].abs()
             / self.cfg.reward_settings.yaw_momentum_tolerance
         )
+        return self._shaped_log_tail(error)
+
+    def _reward_balance_attitude(self):
+        """Trunk upright -> the pose is a handstand, not merely a balance.
+
+        The one term here that is NOT a function of the reduced-order state,
+        and it exists because that state cannot see a lean. The identity the
+        task is built on, d/dt L_p = (c - p) x mg, constrains where the centre
+        of mass sits relative to the contact line and says nothing about the
+        orientation of the trunk carrying it. For a RIGID pendulum those are
+        the same statement -- balance_offset reads 0.55 at a 2 degree rigid
+        lean and -0.26 at 15. For a twelve-joint robot they are not: the rear
+        legs are exactly the redundancy that puts the centre of mass over the
+        contact line at any trunk angle.
+
+        So a robot standing motionless at any lean, with its mass correctly
+        distributed, reads support_momentum exactly zero (every link velocity
+        is zero), com_offset zero, com_vel zero, drift zero and support at
+        ceiling -- the full goal total, while visibly not doing a handstand.
+        A policy trained 5000 iterations found precisely that pose and held a
+        15.1 degree lean 99.2% of the time.
+
+        Measured on projected_gravity, which is already an ACTOR observation.
+        That makes this the only reward whose quantity the policy can read
+        directly -- com_offset and support_momentum are critic-side and have
+        to be inferred through implicit forward kinematics -- so expect it to
+        be learned faster than its weight alone suggests.
+
+        Isotropic, unlike the offset and momentum tolerances. Those are
+        anisotropic because the support polygon is a line; this is a pose
+        quantity, not a balance quantity, and a handstand leaning sideways is
+        as wrong as one leaning over the toes. If the policy starts trading
+        roll for pitch, splitting the tolerance is the first refinement.
+        """
+        error = self._attitude_error() / self.cfg.reward_settings.attitude_tolerance
         return self._shaped_log_tail(error)
 
     def _reward_balance_offset(self):
