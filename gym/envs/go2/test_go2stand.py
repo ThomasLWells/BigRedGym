@@ -233,7 +233,9 @@ def test_vertical_com_velocity_is_free_but_horizontal_is_not():
         moving = _reward_task(com_vel=direction)._reward_com_vel_xy()
         # Isotropic in the horizontal plane: stepping is equally wrong in any
         # direction, unlike the offset and momentum terms.
-        assert moving.item() == pytest.approx(math.exp(-4.0) - 0.2, rel=1e-5)
+        assert moving.item() == pytest.approx(
+            math.exp(-4.0) - 0.2 * math.log1p(1.0), rel=1e-5
+        )
 
 
 def test_tolerances_are_anisotropic_and_not_transposed():
@@ -264,7 +266,6 @@ def test_foot_drift_reports_the_worst_foot_not_the_average():
     assert one_foot_moved.item() < both_still.item()
 
     # The mean would be 0.03 and score distinctly better than the max of 0.06.
-    # Note the logarithmic tail, not _shaped's clamped linear one.
     tolerance = Go2StandCfg.reward_settings.foot_drift_tolerance
     error = 0.06 / tolerance
     expected = math.exp(-4 * error**2) - 0.2 * math.log1p(error)
@@ -351,11 +352,19 @@ def test_yaw_tolerance_bites_at_the_rate_the_policy_actually_turns():
     assert 0.3 < scores[1] < 0.75, "the typical wobble must cost something real"
     assert scores[2] < 0.3, "the tail must be clearly bad"
 
-    # Early training saturates this, and that is accepted: yaw momentum is a
-    # rate and recovers. Drift, which accumulates, is the case where a clamp
-    # is permanent -- hence _shaped_log_tail there and a plain clamp here.
+    # A tolerance this tight means early training runs far out on the tail --
+    # 0.0129 is e = 6.45 -- which is exactly where a clamp at e = 3 would hand
+    # the policy a constant. On the shared logarithmic tail it still sees a
+    # slope, so the term can teach from the noisy regime rather than only
+    # scoring it.
+    tolerance = Go2StandCfg.reward_settings.yaw_momentum_tolerance
+    error = 0.0129 / tolerance
     noisy = _reward_task(momentum=(0.0, 0.0, 0.0129))._reward_balance_yaw()
-    assert noisy.item() == pytest.approx(math.exp(-36) - 0.6, abs=1e-6)
+    assert noisy.item() == pytest.approx(
+        math.exp(-4 * error**2) - 0.2 * math.log1p(error), abs=1e-6
+    )
+    worse = _reward_task(momentum=(0.0, 0.0, 0.0258))._reward_balance_yaw()
+    assert worse.item() < noisy.item() - 0.1, "the tail must still push at e = 6"
 
 
 def test_drift_gradient_survives_many_tolerances_of_displacement():
@@ -365,7 +374,7 @@ def test_drift_gradient_survives_many_tolerances_of_displacement():
     any clamp within about half a second and stays there for the rest of the
     episode. A constant is invisible to PPO -- GAE cancels it and advantages
     are variance-normalized -- so a clamped term's weight would stop meaning
-    anything. Hence the logarithmic tail; with _shaped's clamp instead, every
+    anything. Hence the logarithmic tail; against a clamp at e = 3 every
     assertion below is an equality.
     """
     scores = [
@@ -393,20 +402,21 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
         drift=100.0,
         com_vel=(100.0, 0.0, 0.0),
     )
-    floor = math.exp(-4 * 3.0**2) - 0.6
-    for reward in (
-        far._reward_balance_momentum,
-        far._reward_balance_offset,
-        far._reward_com_height,
-        far._reward_com_vel_xy,
-        far._reward_balance_yaw,
-    ):
-        assert reward().item() == pytest.approx(floor, abs=1e-6)
-
-    # Drift is on the logarithmic tail, so it bottoms out lower and only at
-    # its own guard of e = 40 (2 m of drift).
-    drift_floor = math.exp(-4 * 40.0**2) - 0.2 * math.log1p(40.0)
-    assert far._reward_front_feet_drift().item() == pytest.approx(drift_floor, abs=1e-6)
+    # One shaping function, so one floor: the e = 40 guard of the logarithmic
+    # tail, reached here by every term at once.
+    floor = math.exp(-4 * 40.0**2) - 0.2 * math.log1p(40.0)
+    shaped = (
+        "balance_momentum",
+        "balance_offset",
+        "com_height",
+        "com_vel_xy",
+        "balance_yaw",
+        "front_feet_drift",
+    )
+    for name in shaped:
+        assert getattr(far, f"_reward_{name}")().item() == pytest.approx(
+            floor, abs=1e-6
+        )
 
     # The alive bonus must outweigh every floor at once, or the per-step
     # total goes negative and terminating becomes the cheaper option.
@@ -414,11 +424,9 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     # it does not enter. Summed from the config rather than hardcoded, so
     # adding a term or retuning a weight fails here rather than in a GPU run.
     weights = Go2StandRunnerCfg().critic.reward.weights
-    clamped = sum(
-        getattr(weights, name)
-        for name in ("balance_momentum", "balance_offset", "com_vel_xy", "balance_yaw")
+    worst = floor * sum(
+        getattr(weights, name) for name in shaped if hasattr(weights, name)
     )
-    worst = clamped * floor + weights.front_feet_drift * drift_floor
     assert weights.balance_alive + worst > 0.0
     # com_height is off: an absent key, not a zero, because this weights class
     # does not inherit. If it is ever re-enabled it joins the sum above.

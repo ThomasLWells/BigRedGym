@@ -205,6 +205,11 @@ class OnPolicyRunner(BaseRunner):
             ["mean_value_loss", "mean_surrogate_loss", "learning_rate"],
         )
         logger.register_category("actor", self.alg.actor, ["action_std", "entropy"])
+        # Tasks opt in to logging their own per-iteration scalars by declaring
+        # `log_categories`; a curriculum stage index is invisible otherwise,
+        # and the runner should not need to know any task's attribute names.
+        for category, attributes in getattr(self.env, "log_categories", {}).items():
+            logger.register_category(category, self.env, attributes)
 
         logger.attach_torch_obj_to_wandb((self.alg.actor, self.alg.critic))
 

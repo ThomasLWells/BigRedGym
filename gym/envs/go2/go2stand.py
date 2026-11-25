@@ -38,6 +38,7 @@ import math
 import torch
 
 from gym.envs.go2.go2 import Go2
+from gym.envs.go2.go2stand_curriculum import HandstandPendulum
 from gym.utils.sampling import masked_update
 from gym.utils.torch_quat import quat_apply
 
@@ -45,6 +46,11 @@ GRAVITY = 9.81
 
 
 class Go2Stand(Go2):
+    # Picked up by the runner's logger so the stage trace reaches vitals.jsonl
+    # and wandb. Without it a curriculum run is uninterpretable: the one thing
+    # worth knowing is which lean the policy stalled at.
+    log_categories = {"stand": ["curriculum_stage", "curriculum_success_rate"]}
+
     def _init_buffers(self):
         super()._init_buffers()
 
@@ -146,11 +152,131 @@ class Go2Stand(Go2):
             device=self.device,
         )
 
+        # reset_to_curriculum draws its joint jitter from the same tensors
+        # reset_to_range does, but _init_buffers only builds those for that one
+        # mode -- so build them here when the curriculum is driving.
+        if self.cfg.init_state.reset_mode == "reset_to_curriculum":
+            self.initialize_ranges_for_initial_conditions()
+
+        self._pendulum = HandstandPendulum.from_config(self.cfg)
+        stages = self.cfg.curriculum
+        self._curriculum_schedule = self._pendulum.schedule(
+            stages.start_energy, stages.ratio, stages.max_lean_step
+        )
+        # The entire curriculum state is this one index: the sampler generates
+        # states from the budget directly, so there are no range tensors to
+        # keep in sync and no way for the config and the live distribution to
+        # disagree.
+        self.curriculum_stage = 0
+        self.curriculum_success_rate = 0.0
+        self._curriculum_episodes = 0.0
+        self._apply_curriculum_stage()
+
         self._update_support_frame()
         self._update_reduced_order_state()
         self._update_foot_slip()
 
+    # ------------ curriculum ----------------
+
+    def _apply_curriculum_stage(self):
+        """Cache what depends on the stage index, including termination.
+
+        The last stage leans to within 0.017 rad of the configured attitude
+        threshold, so a sample there would terminate on its first outward step.
+        The threshold therefore follows the stage -- but only ever upward, so
+        every stage below roughly 20 degrees of lean keeps the configured 0.6
+        exactly and nothing about the established behaviour moves.
+
+        Note the units. ``max_attitude_error`` is a CHORD on the unit sphere
+        (it compares projected_gravity against its target), not an angle, so
+        permitting a lean of phi takes 2 sin(phi/2) rather than phi.
+        """
+        self._curriculum_epsilon = self._curriculum_schedule[self.curriculum_stage]
+        self._curriculum_lean_cap = min(
+            self._pendulum.max_lean_at_rest(self._curriculum_epsilon),
+            self._pendulum.lean_cap,
+        )
+        allowed = min(
+            self._curriculum_lean_cap + self.cfg.curriculum.termination_margin,
+            math.pi,
+        )
+        self._max_attitude_error = max(
+            self.cfg.termination.max_attitude_error,
+            2.0 * math.sin(0.5 * allowed),
+        )
+
+    def _score_curriculum(self, reset_mask):
+        """Score the episodes ending now and clear the stage if they pass.
+
+        Called at the TOP of ``_reset_idx``, for two reasons: the flags and
+        the episode counter are still those of the episode that just ended,
+        and an advance then takes effect on the very envs resetting on this
+        step rather than a policy step later.
+        """
+        # An env that has not run is not an episode. The startup reset() calls
+        # _reset_idx with `terminated` still all-True from construction, which
+        # would otherwise book num_envs failures before a single step.
+        finished = reset_mask & (self.episode_length_buf > 0)
+        count = int(finished.sum())
+        if count == 0:
+            return
+
+        # timed_out and terminated are NOT mutually exclusive -- nothing
+        # clears terminated when the horizon fires -- so a fall on the last
+        # step of an episode has both set, and gating on the timeout alone
+        # would score it a success.
+        succeeded = float((finished & self.timed_out & ~self.terminated).sum())
+
+        stages = self.cfg.curriculum
+        # One EMA step per episode, in closed form for the whole batch, so the
+        # rate does not depend on how resets happen to clump across steps.
+        retain = (1.0 - 1.0 / stages.rate_time_constant) ** count
+        self.curriculum_success_rate += (1.0 - retain) * (
+            succeeded / count - self.curriculum_success_rate
+        )
+        self._curriculum_episodes += count
+
+        if (
+            self._curriculum_episodes >= stages.min_episodes
+            and self.curriculum_success_rate >= stages.success_rate
+            and self.curriculum_stage + 1 < len(self._curriculum_schedule)
+        ):
+            self.curriculum_stage += 1
+            # From zero, not from the rate just achieved: how well the policy
+            # held the stage it has left says nothing about the new one, and
+            # starting at zero gives the next stage a settling period for free.
+            self.curriculum_success_rate = 0.0
+            self._curriculum_episodes = 0.0
+            self._apply_curriculum_stage()
+
+    def reset_to_curriculum(self, reset_mask):
+        """Spawn on the current stage's energy manifold.
+
+        A reset mode of its own rather than a widening of ``root_pos_range``,
+        because the lean, the lean rate and the base position are correlated --
+        the position is a function of the lean, and the admissible rate band is
+        a function of both the lean and the budget. Independent per-axis boxes
+        cannot express that, so they would spawn states off the manifold.
+        """
+        # The joint jitter and its range tensors, unchanged from what trained
+        # before; the root pose it also samples is then discarded, the write
+        # below covering all 13 components.
+        self.reset_to_range(reset_mask)
+
+        theta, theta_dot = self._pendulum.sample(
+            self._curriculum_epsilon,
+            self.num_envs,
+            lean_cap=self._curriculum_lean_cap,
+            device=self.device,
+        )
+        masked_update(
+            self.root_states,
+            self._pendulum.to_root_state(theta, theta_dot),
+            reset_mask,
+        )
+
     def _reset_idx(self, reset_mask):
+        self._score_curriculum(reset_mask)
         super()._reset_idx(reset_mask)
         # dof_pos_target is a residual that _compute_torques adds
         # default_dof_pos to, and LeggedRobot._reset_idx seeds it *with*
@@ -199,7 +325,10 @@ class Go2Stand(Go2):
         attitude_error = torch.norm(
             self.projected_gravity - self._target_projected_gravity, dim=1
         )
-        self.terminated |= attitude_error > self.cfg.termination.max_attitude_error
+        # Stage-dependent, not the raw config value -- see
+        # _apply_curriculum_stage. Equal to it for every stage up to roughly
+        # 20 degrees of lean.
+        self.terminated |= attitude_error > self._max_attitude_error
 
     def _prefix_subset(self, names, prefixes):
         """Positions in ``names`` whose entry starts with one of ``prefixes``."""
@@ -364,31 +493,23 @@ class Go2Stand(Go2):
 
     # ------------ rewards ----------------
 
-    def _shaped(self, error):
-        """Squared exponential with a bounded linear tail.
-
-        The linear companion carries the far field: _sqrdexp is exp(-4e^2)
-        here, whose derivative is numerically zero past about e = 1.5, leaving
-        a falling robot with no gradient telling it which way to correct.
-
-        The clamp bounds each term at -0.6 so that riding a fall down is never
-        worth less than terminating. A terminating step masks off the dense
-        weights and costs only -weight * dt = -1e-4, so an unbounded tail
-        would make "finish the fall quickly" the best available action -- and
-        early in training, when nothing can hold the pose, the only gradient
-        there is. _reward_balance_alive pays for the bounded remainder.
-        """
-        return self._sqrdexp(error) - 0.2 * error.clamp(max=3.0)
-
     def _shaped_log_tail(self, error):
         """Squared exponential with a tail that never goes flat.
 
-        For quantities that accumulate monotonically within an episode, a
-        clamped tail is fatal: once past the clamp the term is a constant, and
-        a constant is invisible to PPO at any weight -- GAE cancels it as soon
-        as the critic adapts, and advantages are variance-normalized on top of
-        that. Foot drift is the one such quantity here, so raising its weight
-        would otherwise do nothing at all.
+        The one shaping function in this task; `error` is a magnitude, already
+        divided by its tolerance, and must be non-negative (log1p diverges at
+        -1). Every caller passes a norm or an abs.
+
+        A clamped tail is fatal wherever the policy can sit past the clamp,
+        because there the term is a constant, and a constant is invisible to
+        PPO at any weight -- GAE cancels it as soon as the critic adapts, and
+        advantages are variance-normalized on top of that. Two things put the
+        policy there. Foot drift accumulates monotonically within an episode,
+        so raising its weight under a clamp did nothing at all for 900
+        iterations. And the curriculum *spawns* the robot at its stage's lean
+        cap: by the 18.97-degree stage the offset error alone is e = 3.3, so a
+        clamp at e = 3 would hand the robot zero gradient on precisely the
+        terms meant to guide it home.
 
         log1p keeps the far field bounded in practice while never zeroing the
         gradient, which stays at -0.2/(1+e). This is *weaker* than the clamped
@@ -396,9 +517,9 @@ class Go2Stand(Go2):
         drift); the point is not a bigger push but one that survives, so that
         the weight is a working knob.
 
-        The clamp at e = 40 is a floor guard at 2 m of drift, not a shaping
-        choice -- com_vel_xy dominates long before that. It bounds the term at
-        -0.743, which is what _reward_balance_alive's sum is computed against.
+        The clamp at e = 40 is a floor guard -- 2 m of drift, or 46 degrees of
+        lean -- not a shaping choice. It bounds the term at -0.743, which is
+        what _reward_balance_alive's sum is computed against.
         """
         return self._sqrdexp(error) - 0.2 * torch.log1p(error.clamp(max=40.0))
 
@@ -406,14 +527,13 @@ class Go2Stand(Go2):
         """Constant, and the only term that is not about the pendulum.
 
         Sized so the per-step total stays strictly positive everywhere in the
-        reachable state space. The four _shaped terms bottom out at
-        -0.6 * (3 + 2 + 1 + 1) = -4.2 weighted, and front_feet_drift on the
-        logarithmic tail bottoms at -0.743 * 2.0 = -1.49, for a floor of -5.69
-        against this term's 6.0 (front_feet_support is a smoothstep in [0, 1]
-        and cannot go negative). The constraint to preserve when retuning:
+        reachable state space. Every shaped term now shares the one
+        logarithmic tail and so bottoms out at -0.743, giving a floor of
+        -0.743 * (3 + 2 + 1 + 1 + 2) = -6.69 weighted against this term's 7.0
+        (front_feet_support is a smoothstep in [0, 1] and cannot go negative).
+        The constraint to preserve when retuning:
 
-            balance_alive >= 0.6 * sum(clamped term weights)
-                             + 0.743 * front_feet_drift
+            balance_alive >= 0.743 * sum(shaped term weights)
 
         Being constant, it says nothing about *how* to balance, so it adds no
         shaping of its own.
@@ -435,7 +555,7 @@ class Go2Stand(Go2):
         error = torch.norm(
             self.support_momentum[:, :2] / self._momentum_tolerance, dim=1
         )
-        return self._shaped(error)
+        return self._shaped_log_tail(error)
 
     def _reward_balance_yaw(self):
         """Angular momentum about the vertical -> 0.
@@ -458,7 +578,7 @@ class Go2Stand(Go2):
             self.support_momentum[:, 2].abs()
             / self.cfg.reward_settings.yaw_momentum_tolerance
         )
-        return self._shaped(error)
+        return self._shaped_log_tail(error)
 
     def _reward_balance_offset(self):
         """Hold the centre of mass over the support anchor.
@@ -479,7 +599,7 @@ class Go2Stand(Go2):
         0.06 is two-thirds of that, keeping the two within a factor 1.6.
         """
         error = torch.norm(self.com_offset / self._offset_tolerance, dim=1)
-        return self._shaped(error)
+        return self._shaped_log_tail(error)
 
     def _reward_com_height(self):
         """Two-sided tracking of the centre-of-mass height above the feet.
@@ -503,7 +623,7 @@ class Go2Stand(Go2):
         error = (
             self.com_height.squeeze(1) - self.cfg.reward_settings.com_height_target
         ) / self.cfg.reward_settings.com_height_tolerance
-        return self._sqrdexp(error) - 0.2 * error.abs().clamp(max=3.0)
+        return self._shaped_log_tail(error.abs())
 
     def _reward_com_vel_xy(self):
         """Penalize horizontal centre-of-mass speed, leaving vertical free.
@@ -530,7 +650,7 @@ class Go2Stand(Go2):
             torch.norm(self.com_vel[:, :2], dim=1)
             / self.cfg.reward_settings.com_vel_tolerance
         )
-        return self._shaped(error)
+        return self._shaped_log_tail(error)
 
     def _reward_front_feet_drift(self):
         """Displacement of each support foot from where it was planted.

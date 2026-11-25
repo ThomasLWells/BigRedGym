@@ -39,6 +39,44 @@ TARGET_PROJECTED_GRAVITY = [1.0, 0.0, 0.0]
 # same proxy and must not be reused elsewhere.
 HANDSTAND_COM_HEIGHT = 0.5806
 
+# Reduced-order pendulum constants, for the curriculum (go2stand_curriculum.py).
+#
+# HANDSTAND_PENDULUM_LENGTH is NOT HANDSTAND_COM_HEIGHT and the two must not be
+# swapped. The reward measures the centre of mass above the foot body ORIGIN,
+# because that is where the support anchor sits. The pendulum pivots on the
+# contact PLANE, one foot radius lower, so it is 22 mm longer. Using 0.5806
+# here understates the goal energy by 3.5 J.
+#
+# HANDSTAND_INERTIA is measured kinematically, not fitted from a fall: impose a
+# unit rigid rotation about the contact line with the joints locked and read
+# 2*KE off the mass matrix. Fitting a zero-action fall instead gives nonsense,
+# because a position PD at this posture produces zero torque, so the legs sag
+# 6.5 cm before the robot tips -- that trajectory is variable-length, not a
+# rigid rotation, and I_eff = 2*KE/theta_dot^2 blows up while the motion is
+# radial. Curriculum states ARE rigid rotations, so this is the right number
+# for them.
+#
+# Note m*r^2 = 5.91 against I = 6.48: the point-mass form is 9% low, the rear
+# legs being 4.7 kg out at 0.93 m.
+HANDSTAND_MASS = 16.2764
+HANDSTAND_PENDULUM_LENGTH = 0.60262
+HANDSTAND_INERTIA = 6.4796
+# Front-foot contact point, 2.3 mm behind the base origin in the solved pose.
+HANDSTAND_PIVOT_X = -0.00228
+
+# Curriculum schedule, generated rather than listed -- see
+# HandstandPendulum.schedule. Starts where the policy already is: the old reset
+# box (pitch +/-0.02 rad, rate +/-0.1 rad/s) is 0.019 J of potential plus
+# 0.032 J of kinetic, so stage 0 at 0.05 J is the task already solved.
+#
+# Geometric growth keeps the early steps sub-degree, but unchecked it turns
+# into 6 degree jumps at the top, so the lean step is capped. Together: 19
+# stages, biggest energy jump 2.3 J and biggest lean jump 2.5 degrees, against
+# 8.0 J and 8.9 degrees for plain doubling.
+CURRICULUM_START_ENERGY = 0.05
+CURRICULUM_RATIO = 1.5
+CURRICULUM_MAX_LEAN_STEP = 0.0436  # 2.5 degrees
+
 # Front legs reach "down" and rear legs "up" along the trunk axis. The calf is
 # at its straightest for both pairs; the thigh angles put the front feet under
 # the CoM and the rear legs as close to the trunk axis as they can get.
@@ -91,7 +129,7 @@ class Go2StandCfg(Go2Cfg):
             "RR_calf_joint": REAR_CALF,
         }
 
-        reset_mode = "reset_to_range"
+        reset_mode = "reset_to_curriculum"
         pos = [0.0, 0.0, HANDSTAND_HEIGHT]
         # x,y,z,w. Pitch +90 deg about y -- the handstand attitude, which gives
         # projected_gravity = (1, 0, 0). Needed because play.py overrides
@@ -100,17 +138,19 @@ class Go2StandCfg(Go2Cfg):
         # trained policy would be evaluated from a flat drop.
         rot = [0.0, 0.7071068, 0.0, 0.7071068]
 
-        # Stage 0 of the reverse-reachability curriculum: initialise inside the
-        # goal set, so the policy only has to learn to hold the pose. Later
-        # stages widen pitch and pitch rate together along the paper's
-        # closed-form balanceable region, one layer of the backward reachable
-        # set per widening.
+        # SUPERSEDED for the root by reset_to_curriculum, which samples the
+        # lean and lean rate together from an energy manifold -- a correlated
+        # distribution, with the base position a function of the lean, that
+        # independent per-axis boxes cannot express. Kept because play.py
+        # overrides reset_mode to "reset_to_basic", because
+        # initialize_ranges_for_initial_conditions reads all four lists, and
+        # because this box is the measurement stage 0 is sized against:
+        # pitch +/-0.02 rad is 0.019 J and +/-0.1 rad/s is 0.032 J, so
+        # CURRICULUM_START_ENERGY = 0.05 J is this same set.
         #
-        # The hook for that is NOT this config. initialize_ranges_for_initial_
-        # conditions() runs exactly once, from _init_buffers, so editing these
-        # lists mid-training is inert. reset_to_range reads the *tensors* it
-        # built -- env.root_pos_range, env.root_vel_range, env.dof_pos_range --
-        # live at every reset, and those are what a curriculum must mutate.
+        # The dof lists below are NOT superseded -- reset_to_curriculum draws
+        # the joint jitter from exactly these, the whole-body lean being a
+        # rigid rotation that leaves the joints where they were.
         root_pos_range = [
             [0.0, 0.0],  # x
             [0.0, 0.0],  # y
@@ -177,6 +217,42 @@ class Go2StandCfg(Go2Cfg):
         # collecting samples from a robot that is already down.
         max_attitude_error = 0.6
 
+    class curriculum:
+        # Stage energies, from HandstandPendulum.schedule -- see the
+        # CURRICULUM_* constants above for why these three values.
+        start_energy = CURRICULUM_START_ENERGY
+        ratio = CURRICULUM_RATIO
+        max_lean_step = CURRICULUM_MAX_LEAN_STEP
+
+        # Advancement. Success is timed_out & ~terminated: the flags are not
+        # mutually exclusive, so gating on the timeout alone scores falls that
+        # happen to coincide with the horizon as successes.
+        success_rate = 0.8
+        # Episodes of smoothing on the success rate, and the minimum that must
+        # finish at a stage before it can be cleared.
+        #
+        # Size these in EPISODES but check them in ITERATIONS, because the
+        # conversion is both surprising and not constant. At 4096 envs, a
+        # 100 Hz policy and 10 s episodes, one episode is 1000 steps while an
+        # iteration advances each env by only rollout_size / num_envs = 8 --
+        # so a *succeeding* policy retires just 33 episodes per iteration. A
+        # failing one dies in under a second and retires more like 450. The
+        # gate is therefore slowest exactly when the policy is doing well,
+        # which is the regime it has to make a decision in.
+        #
+        # The rate is reset to zero on every advance -- performance at the
+        # stage just left says nothing about the new one -- so the real floor
+        # is the EMA's own rise time: from zero it takes 1.6 time constants to
+        # read 0.8 even if every single episode succeeds. At 100 that is 161
+        # episodes, about 5 iterations, so traversing all 19 stages costs ~93
+        # iterations of pure gate latency out of the 1000 budgeted.
+        rate_time_constant = 100.0
+        min_episodes = 150.0
+        # Radians of lean past the stage's spawn cap that the attitude
+        # termination must allow. Without it the last stage spawns 0.017 rad
+        # inside the threshold and dies on its first outward step.
+        termination_margin = 0.25
+
     class reward_settings(Go2Cfg.reward_settings):
         # Read by scripts/check_stand_init.py and by the termination check; no
         # reward uses base_height_target, the height target being on the centre
@@ -187,6 +263,13 @@ class Go2StandCfg(Go2Cfg):
         # Load-bearing even though _reward_com_height is zero-weighted: it is
         # the pendulum length in the angular-momentum normalizer.
         com_height_target = HANDSTAND_COM_HEIGHT
+
+        # Reduced-order pendulum constants, read by HandstandPendulum.
+        # from_config. No reward uses them.
+        handstand_mass = HANDSTAND_MASS
+        handstand_pendulum_length = HANDSTAND_PENDULUM_LENGTH
+        handstand_inertia = HANDSTAND_INERTIA
+        handstand_pivot_x = HANDSTAND_PIVOT_X
         # Loose, because varying centre-of-mass height is the control authority
         # the reduced-order model is about. 3 cm scores 0.73, 6 cm scores 0.27,
         # folding the legs to 0.30 m bottoms the term out. Not looser than
@@ -207,8 +290,9 @@ class Go2StandCfg(Go2Cfg):
         # the polygon edge at e = 0.95.
         support_offset_tolerance = [0.06, 0.15]
         # Metres a support foot may slide from where it was planted, per error
-        # unit. Against the logarithmic tail (_shaped_log_tail, not _shaped):
-        # 2 cm scores 0.46, 10 cm scores -0.22, and 50 cm scores -0.48 while
+        # unit. Against the logarithmic tail (_shaped_log_tail, the task's one
+        # shaping function): 2 cm scores 0.46, 10 cm scores -0.22, and 50 cm
+        # scores -0.48 while
         # still pushing back at -0.36 per metre.
         foot_drift_tolerance = 0.05
         # Metres per second of HORIZONTAL centre-of-mass speed per error unit.
@@ -377,20 +461,21 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # only gradient available to an untrained policy points at
                 # falling faster.
                 #
-                # Every _shaped term floors at -0.6, and front_feet_drift on
-                # the logarithmic tail floors at -0.743, so the constraint is
+                # Every shaped term shares the one logarithmic tail and so
+                # floors at -0.743, giving the constraint
                 #
-                #     balance_alive >= 0.6 * (balance_momentum + balance_offset
-                #                             + com_vel_xy + balance_yaw)
-                #                      + 0.743 * front_feet_drift
+                #     balance_alive >= 0.743 * (balance_momentum
+                #                               + balance_offset + com_vel_xy
+                #                               + balance_yaw
+                #                               + front_feet_drift)
                 #
-                # Here 0.6 * 7 + 0.743 * 2 = 5.686, against 6.0 -> worst case
-                # +0.31. (front_feet_support is a smoothstep in [0, 1] and
-                # cannot go negative, so it never enters.)
+                # Here 0.743 * 9 = 6.687, against 7.0 -> worst case +0.31.
+                # (front_feet_support is a smoothstep in [0, 1] and cannot go
+                # negative, so it never enters.)
                 #
                 # RAISE THIS IF YOU RAISE ANY OF THOSE WEIGHTS. A test asserts
                 # the inequality; a GPU run would not.
-                balance_alive = 6.0
+                balance_alive = 7.0
 
             class termination_weight:
                 # The terminal reward is -weight * dt, so this is tiny by
