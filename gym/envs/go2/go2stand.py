@@ -49,7 +49,21 @@ class Go2Stand(Go2):
     # Picked up by the runner's logger so the stage trace reaches vitals.jsonl
     # and wandb. Without it a curriculum run is uninterpretable: the one thing
     # worth knowing is which lean the policy stalled at.
-    log_categories = {"stand": ["curriculum_stage", "curriculum_success_rate"]}
+    #
+    # stage_max against stage is how far the curriculum overshot before
+    # correcting, i.e. whether the hysteresis is earning its keep.
+    # review_episodes is a self-check on the gate itself: it should read about
+    # cfg.curriculum.review_episodes, and a much larger number means episodes
+    # are arriving in bursts far bigger than the rollout budget implies.
+    log_categories = {
+        "stand": [
+            "curriculum_stage",
+            "curriculum_stage_max",
+            "curriculum_window_rate",
+            "curriculum_reviews",
+            "curriculum_review_episodes",
+        ]
+    }
 
     def _init_buffers(self):
         super()._init_buffers()
@@ -163,13 +177,34 @@ class Go2Stand(Go2):
         self._curriculum_schedule = self._pendulum.schedule(
             stages.start_energy, stages.ratio, stages.max_lean_step
         )
-        # The entire curriculum state is this one index: the sampler generates
-        # states from the budget directly, so there are no range tensors to
-        # keep in sync and no way for the config and the live distribution to
-        # disagree.
+        # The difficulty itself is this one index: the sampler generates states
+        # from the budget directly, so there are no range tensors to keep in
+        # sync and no way for the config and the live distribution to disagree.
+        # Everything else here is the review bookkeeping.
         self.curriculum_stage = 0
-        self.curriculum_success_rate = 0.0
-        self._curriculum_episodes = 0.0
+        self.curriculum_stage_max = 0
+        self.curriculum_window_rate = 0.0
+        self.curriculum_reviews = 0
+        self.curriculum_review_episodes = 0.0
+        self._window_successes = 0.0
+        self._window_episodes = 0.0
+        self._curriculum_stage_step = 0
+        # Which stage each env's CURRENT episode began under. A demotion
+        # tightens the attitude termination, so envs already past the new
+        # threshold terminate at once; counting those against the new stage
+        # would depress its first window and demote again, cascading to zero.
+        # Scoring only episodes that started here is also just the honest
+        # statistic -- a window should measure the stage it claims to.
+        # A window samples each env's first episode to START after the window
+        # opened: `fresh` marks an env that has begun such an episode and
+        # `reported` one that has already contributed. See _score_curriculum
+        # for why both halves are needed.
+        self._curriculum_fresh = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._curriculum_reported = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self._apply_curriculum_stage()
 
         self._update_support_frame()
@@ -191,13 +226,31 @@ class Go2Stand(Go2):
         (it compares projected_gravity against its target), not an angle, so
         permitting a lean of phi takes 2 sin(phi/2) rather than phi.
         """
+        # Maintained here rather than in _change_stage so the invariant holds
+        # however the stage was set -- play.py pins it directly from
+        # --curriculum_stage, and a stale high-water mark would misreport how
+        # far a run had overshot.
+        self.curriculum_stage_max = max(
+            self.curriculum_stage_max, self.curriculum_stage
+        )
         self._curriculum_epsilon = self._curriculum_schedule[self.curriculum_stage]
         self._curriculum_lean_cap = min(
             self._pendulum.max_lean_at_rest(self._curriculum_epsilon),
             self._pendulum.lean_cap,
         )
+        # Driven by the HIGH-WATER mark, so the threshold only ever loosens.
+        # If it tracked the live stage, a demotion would tighten it and every
+        # env sitting between the old and new values would terminate on the
+        # next step -- collecting a termination penalty and a truncated return
+        # for a fall that never happened, at every demotion, for a large
+        # fraction of the envs. The attitude check is a sample-efficiency gate
+        # and no reward term mentions attitude, so there is nothing to buy by
+        # tightening it back down. Worst case it sits 36% above the configured
+        # value, which only ever costs a few extra samples per episode.
+        widest = self._curriculum_schedule[self.curriculum_stage_max]
         allowed = min(
-            self._curriculum_lean_cap + self.cfg.curriculum.termination_margin,
+            min(self._pendulum.max_lean_at_rest(widest), self._pendulum.lean_cap)
+            + self.cfg.curriculum.termination_margin,
             math.pi,
         )
         self._max_attitude_error = max(
@@ -205,49 +258,114 @@ class Go2Stand(Go2):
             2.0 * math.sin(0.5 * allowed),
         )
 
-    def _score_curriculum(self, reset_mask):
-        """Score the episodes ending now and clear the stage if they pass.
+    def _change_stage(self, delta):
+        """Move the curriculum one stage and start the new one clean."""
+        self.curriculum_stage += delta
+        # Evidence gathered at the stage just left says nothing about the new
+        # one, in either direction.
+        self._open_window()
+        self._apply_curriculum_stage()
 
-        Called at the TOP of ``_reset_idx``, for two reasons: the flags and
-        the episode counter are still those of the episode that just ended,
-        and an advance then takes effect on the very envs resetting on this
-        step rather than a policy step later.
+    def _open_window(self):
+        """Start a fresh review window.
+
+        Nobody is `fresh`: episodes already in flight were begun before this
+        window opened and are not part of its sample.
+        """
+        self._window_successes = 0.0
+        self._window_episodes = 0.0
+        self._curriculum_fresh.fill_(False)
+        self._curriculum_reported.fill_(False)
+        self._curriculum_stage_step = self.common_step_counter
+
+    def _score_curriculum(self, reset_mask):
+        """Review the stage periodically and move it up or down.
+
+        Called at the TOP of ``_reset_idx``, for two reasons: the flags, the
+        episode counter and the per-env stage stamp are still those of the
+        episode that just ended, and a stage change then takes effect on the
+        very envs resetting on this step rather than a policy step later.
+
+        A *review* rather than a running average. The previous version kept an
+        EMA that was reset to zero on every promotion, which made its own rise
+        time -- not the policy's competence -- the thing pacing the curriculum;
+        and an EMA reset to zero is not an unbiased estimate of anything.
+
+        The sample is **each env's first episode to START after the window
+        opened**, exactly once per env. Both halves of that are needed, and
+        each guards against a bias in the opposite direction.
+
+        Counting episodes instead of envs is length-biased toward FAILURES.
+        Episode length correlates with outcome by construction -- a fall
+        resolves in under a second, a hold takes the full ten -- so a failing
+        env reports twenty times for every once a succeeding one does. Against
+        a true 90% policy that reads 0.68, and 0.40 on the first review after a
+        stage change, which would demote it.
+
+        Counting each env's *in-flight* episode is length-biased toward
+        SUCCESSES, by the same ratio working the other way: holds occupy
+        twenty times more wall-clock than falls, so at any instant most envs
+        are inside one. That is the inspection paradox, and against a true 30%
+        policy it reads 0.95 -- which would promote it. Hence `fresh`: an
+        episode already running when the window opened is not part of the
+        sample.
+
+        Because a window opens on every stage change, this also keeps out
+        episodes spawned at a stage the curriculum has left -- the stale credit
+        that let the previous run clear thirteen stages in twenty-five
+        iterations on the strength of stage-0 episodes.
+
+        Demotion is the point of the exercise. Without it the 2000-iteration
+        run spent 1762 iterations -- 88% of itself -- above a frontier it could
+        not hold, with no way back down.
         """
         # An env that has not run is not an episode. The startup reset() calls
         # _reset_idx with `terminated` still all-True from construction, which
         # would otherwise book num_envs failures before a single step.
-        finished = reset_mask & (self.episode_length_buf > 0)
+        finished = (
+            reset_mask
+            & (self.episode_length_buf > 0)
+            & self._curriculum_fresh
+            & ~self._curriculum_reported
+        )
         count = int(finished.sum())
-        if count == 0:
-            return
-
-        # timed_out and terminated are NOT mutually exclusive -- nothing
-        # clears terminated when the horizon fires -- so a fall on the last
-        # step of an episode has both set, and gating on the timeout alone
-        # would score it a success.
-        succeeded = float((finished & self.timed_out & ~self.terminated).sum())
+        if count:
+            # timed_out and terminated are NOT mutually exclusive -- nothing
+            # clears terminated when the horizon fires -- so a fall on the last
+            # step of an episode has both set, and gating on the timeout alone
+            # would score it a success.
+            self._window_successes += float(
+                (finished & self.timed_out & ~self.terminated).sum()
+            )
+            self._window_episodes += count
+            self._curriculum_reported |= finished
 
         stages = self.cfg.curriculum
-        # One EMA step per episode, in closed form for the whole batch, so the
-        # rate does not depend on how resets happen to clump across steps.
-        retain = (1.0 - 1.0 / stages.rate_time_constant) ** count
-        self.curriculum_success_rate += (1.0 - retain) * (
-            succeeded / count - self.curriculum_success_rate
-        )
-        self._curriculum_episodes += count
-
+        elapsed = self.common_step_counter - self._curriculum_stage_step
         if (
-            self._curriculum_episodes >= stages.min_episodes
-            and self.curriculum_success_rate >= stages.success_rate
+            self._window_episodes < stages.review_fraction * self.num_envs
+            or elapsed < stages.min_review_steps
+        ):
+            return
+
+        self.curriculum_window_rate = self._window_successes / self._window_episodes
+        self.curriculum_reviews += 1
+        self.curriculum_review_episodes = self._window_episodes
+        self._open_window()
+
+        # One unbiased window of the whole population decides it; the dead band
+        # between the two rates is the hysteresis, and at this sample size it
+        # is twenty-five standard errors wide.
+        if (
+            self.curriculum_window_rate >= stages.promote_rate
             and self.curriculum_stage + 1 < len(self._curriculum_schedule)
         ):
-            self.curriculum_stage += 1
-            # From zero, not from the rate just achieved: how well the policy
-            # held the stage it has left says nothing about the new one, and
-            # starting at zero gives the next stage a settling period for free.
-            self.curriculum_success_rate = 0.0
-            self._curriculum_episodes = 0.0
-            self._apply_curriculum_stage()
+            self._change_stage(1)
+        elif (
+            self.curriculum_window_rate <= stages.demote_rate
+            and self.curriculum_stage > 0
+        ):
+            self._change_stage(-1)
 
     def reset_to_curriculum(self, reset_mask):
         """Spawn on the current stage's energy manifold.
@@ -278,6 +396,11 @@ class Go2Stand(Go2):
     def _reset_idx(self, reset_mask):
         self._score_curriculum(reset_mask)
         super()._reset_idx(reset_mask)
+        # These episodes begin now, so they belong to the open window -- AFTER
+        # _score_curriculum has had its chance to close one and open another,
+        # which is what keeps a window's sample to episodes spawned under the
+        # stage it is judging.
+        self._curriculum_fresh |= reset_mask
         # dof_pos_target is a residual that _compute_torques adds
         # default_dof_pos to, and LeggedRobot._reset_idx seeds it *with*
         # default_dof_pos -- which would make the PD target twice the support

@@ -5,11 +5,13 @@ Usage:
     uv run scripts/play.py --task mini_cheetah --num_envs 8
     uv run scripts/play.py --task mini_cheetah --load_run May08_12-34-56_ \
                            --checkpoint 1500
+    uv run scripts/play.py --task go2stand --curriculum_stage -1
 
 Supports MuJoCo CPU/Warp and optional VSim checkpoints.
 """
 
 import argparse
+import math
 import random
 
 import torch
@@ -24,6 +26,14 @@ def get_play_args(argv=None):
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--num_envs", type=int, default=32)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--curriculum_stage",
+        type=int,
+        default=None,
+        help="spawn from this curriculum stage instead of the nominal pose; "
+        "negative counts back from the last stage (-1 is the hardest). Only "
+        "for tasks with a curriculum, e.g. go2stand",
+    )
     parser.add_argument(
         "--experiment_name",
         type=str,
@@ -93,7 +103,17 @@ def setup(args):
         env_cfg.commands.resampling_time = 9999
     if hasattr(env_cfg, "push_robots"):
         env_cfg.push_robots.toggle = False
-    env_cfg.init_state.reset_mode = "reset_to_basic"
+    if args.curriculum_stage is None:
+        env_cfg.init_state.reset_mode = "reset_to_basic"
+    elif not hasattr(env_cfg, "curriculum"):
+        raise SystemExit(f"--curriculum_stage: {args.task} has no curriculum")
+    else:
+        # Keep the task's own reset mode so the spawn comes off the stage's
+        # energy manifold, and freeze the stage: reviews are driven from
+        # _reset_idx, so otherwise a long play session would quietly walk the
+        # robot up or down the curriculum and you would not be watching one
+        # stage. A window that can never fill never reviews.
+        env_cfg.curriculum.review_fraction = float("inf")
     if hasattr(env_cfg, "viewer"):
         env_cfg.viewer.show_ui = args.viewer_ui
 
@@ -124,6 +144,22 @@ def setup(args):
         headless=args.headless,
         backend=args.backend,
     )
+
+    if args.curriculum_stage is not None:
+        # The env was built at stage 0 and reset there, so re-reset after
+        # moving it. Negative indices wrap, -1 being the hardest stage.
+        stage = args.curriculum_stage % len(env._curriculum_schedule)
+        env.curriculum_stage = stage
+        env._apply_curriculum_stage()
+        env.reset()
+        epsilon = env._curriculum_epsilon
+        rate = math.sqrt(4.0 * epsilon / env._pendulum.inertia)
+        print(
+            f"curriculum stage {stage}/{len(env._curriculum_schedule) - 1}: "
+            f"eps = {epsilon:.3f} J, lean up to "
+            f"+/-{math.degrees(env._curriculum_lean_cap):.2f} deg, "
+            f"rate up to +/-{rate:.2f} rad/s"
+        )
 
     runner = task_registry.make_alg_runner(env, train_cfg)
     runner.switch_to_eval()

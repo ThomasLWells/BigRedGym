@@ -224,30 +224,66 @@ class Go2StandCfg(Go2Cfg):
         ratio = CURRICULUM_RATIO
         max_lean_step = CURRICULUM_MAX_LEAN_STEP
 
-        # Advancement. Success is timed_out & ~terminated: the flags are not
-        # mutually exclusive, so gating on the timeout alone scores falls that
-        # happen to coincide with the horizon as successes.
-        success_rate = 0.8
-        # Episodes of smoothing on the success rate, and the minimum that must
-        # finish at a stage before it can be cleared.
+        # Advancement, by periodic REVIEW rather than a running average. A
+        # review fires once the window holds both enough episodes and enough
+        # elapsed time, scores them, and clears. Success is
+        # timed_out & ~terminated: the flags are not mutually exclusive, so
+        # gating on the timeout alone scores falls that happen to coincide
+        # with the horizon as successes.
         #
-        # Size these in EPISODES but check them in ITERATIONS, because the
-        # conversion is both surprising and not constant. At 4096 envs, a
-        # 100 Hz policy and 10 s episodes, one episode is 1000 steps while an
-        # iteration advances each env by only rollout_size / num_envs = 8 --
-        # so a *succeeding* policy retires just 33 episodes per iteration. A
-        # failing one dies in under a second and retires more like 450. The
-        # gate is therefore slowest exactly when the policy is doing well,
-        # which is the regime it has to make a decision in.
+        # A window closes when this fraction of the envs have each reported
+        # ONE trial at the current stage. Counting envs rather than episodes is
+        # not a detail -- it is what makes the rate an unbiased estimate.
         #
-        # The rate is reset to zero on every advance -- performance at the
-        # stage just left says nothing about the new one -- so the real floor
-        # is the EMA's own rise time: from zero it takes 1.6 time constants to
-        # read 0.8 even if every single episode succeeds. At 100 that is 161
-        # episodes, about 5 iterations, so traversing all 19 stages costs ~93
-        # iterations of pure gate latency out of the 1000 budgeted.
-        rate_time_constant = 100.0
-        min_episodes = 150.0
+        # Episode length correlates with outcome by construction: a fall
+        # resolves in well under a second, a hold takes the full 10 s. So a
+        # window of "the first N episodes to finish" over-samples failures by
+        # roughly the ratio of those durations, and a failing env can report
+        # twenty times while a succeeding one reports once. Measured on a
+        # policy with a true 90% success rate, such a window reads 0.68 in the
+        # steady state and 0.40 on the first review after a stage change --
+        # which would demote a perfectly competent policy. One trial per env
+        # removes the bias entirely.
+        #
+        # 1.0, not "most of them". Closing early truncates the sample at
+        # whichever envs report first, and those are the FAST ones -- failures
+        # -- so any fraction below 1.0 reintroduces the same bias in miniature:
+        # at 0.9 a true 30% policy reads 0.20. There are no stragglers to guard
+        # against, because timed_out fires at max_episode_length and so every
+        # env is guaranteed to report within two horizons.
+        review_fraction = 1.0
+        # Control steps a window must also span, which is what actually paces
+        # the curriculum: episodes alone can arrive in a burst from envs whose
+        # episode phases have synchronised, and 150 episodes from one cohort
+        # are 150 samples of a single policy snapshot. common_step_counter is
+        # the only clock the env has.
+        #
+        # CONVERSION, which moves if rollout_size or the actor frequency moves:
+        # steps per iteration = num_steps_per_env * n_policy_steps = 8 * 1 = 8,
+        # so 80 steps is 10 iterations.
+        #
+        # This floor is a guard, not the pacer, and it is worth knowing what
+        # the pacer is. A window needs EVERY env to finish an episode begun
+        # after the window opened; an env that reset just before it must first
+        # run out the episode already in flight, so the bound is two horizons
+        # -- 2000 control steps, 250 iterations -- and waiting for all of them
+        # means always paying it. Measured at 250 iterations per promotion.
+        # That latency is a property of episode_length_s, not a tunable, and
+        # it is what runner.max_iterations is sized against.
+        min_review_steps = 80
+        # Promote on sustained success, demote on sustained failure. The gap
+        # between the two IS the anti-oscillation mechanism: a policy holding
+        # 0.6 sits in the dead band and the stage does not move.
+        promote_rate = 0.8
+        demote_rate = 0.4
+        # There is deliberately no "N consecutive reviews" rule. A window is
+        # one unbiased sample of the whole population, so at 4096 envs its
+        # standard error is sqrt(0.25/4096) = 0.008 and the dead band above is
+        # 25 standard errors wide on each side -- noise cannot walk the stage
+        # across it. Requiring two reviews would double the one cost that
+        # actually binds (a review is ~190 iterations) and buy nothing; one
+        # window of 2N is a better estimator than two windows of N that must
+        # both pass.
         # Radians of lean past the stage's spawn cap that the attitude
         # termination must allow. Without it the last stage spawns 0.017 rad
         # inside the threshold and dies on its first outward step.
@@ -500,4 +536,14 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
 
     class runner(Go2RunnerCfg.runner):
         experiment_name = "go2stand"
-        max_iterations = 1000
+        # Sized against the curriculum, not picked round. An honest review
+        # costs TWO episode horizons -- see curriculum.min_review_steps -- so a
+        # stage costs about 250 iterations, measured. Reaching the frontier
+        # found at stage 12-13 therefore costs roughly 3250, on top of the
+        # ~210 that learning the handstand at all took last time. 5000 leaves
+        # about 1500 iterations to consolidate once it settles.
+        #
+        # This is the dominant cost of the curriculum and it is set by
+        # episode_length_s, not by the gate: halving the episode to 5 s would
+        # halve it. Cut this budget only with that in mind.
+        max_iterations = 5000
