@@ -662,3 +662,107 @@ def test_attitude_tolerance_bites_at_the_lean_the_policy_actually_held():
     # Monotone, and still pushing at the lean it has to escape from.
     assert score(5.0) > score(10.0) > score(15.1) > score(25.0)
     assert score(10.0) - score(20.0) > 0.05, "the tail must still pull it in"
+
+
+# ------------ the drift latch ----------------
+
+
+def _drift_task(num_envs=1):
+    """A Go2Stand carrying just what _settle_drift and _foot_drift touch."""
+    task = Go2Stand.__new__(Go2Stand)
+    task.cfg = Go2StandCfg()
+    task.num_envs = num_envs
+    task.device = "cpu"
+    target = Go2StandCfg.reward_settings.target_projected_gravity
+    task._target_projected_gravity = torch.tensor([target])
+    task.projected_gravity = torch.tensor([list(target)]).repeat(num_envs, 1)
+    task.front_feet_indices = torch.tensor([0, 1])
+    task._rigid_body_pos = torch.zeros(num_envs, 2, 3)
+    task._front_feet_anchor = torch.zeros(num_envs, 2, 2)
+    task._drift_settled = torch.zeros(num_envs, dtype=torch.bool)
+    return _tolerances(task)
+
+
+def _place_feet(task, x):
+    task._rigid_body_pos[:, :, 0] = x
+
+
+def _lean_to(task, degrees):
+    task.projected_gravity[:] = torch.tensor([_gravity_at_lean(math.radians(degrees))])
+
+
+def test_stepping_is_free_until_the_handstand_is_achieved():
+    """The whole point of the latch: recovering from a far spawn genuinely
+    requires stepping, so the anchor follows the feet until the robot is
+    upright. A flat drift limit without this would kill exactly the recovery
+    the curriculum exists to teach."""
+    task = _drift_task()
+    _lean_to(task, 25.0)  # still righting itself
+
+    for x in (0.0, 0.1, 0.25, 0.5):
+        _place_feet(task, x)
+        task._settle_drift()
+        assert task._foot_drift().item() == pytest.approx(0.0, abs=1e-6), (
+            "a robot still getting upright was charged for stepping"
+        )
+    assert not task._drift_settled.any()
+    assert task._reward_front_feet_drift().item() == pytest.approx(1.0)
+
+
+def test_the_anchor_lands_where_the_handstand_was_achieved():
+    """Not at reset, and not a step late."""
+    task = _drift_task()
+    _lean_to(task, 25.0)
+    _place_feet(task, 0.40)
+    task._settle_drift()
+
+    _lean_to(task, 1.0)  # arrives upright, still standing at x = 0.40
+    task._settle_drift()
+    assert task._drift_settled.all()
+    assert task._front_feet_anchor[0, 0, 0].item() == pytest.approx(0.40)
+    assert task._foot_drift().item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_latch_does_not_release_when_the_trunk_tips_again():
+    """The anti-exploitation property. If tipping re-planted the anchor the
+    policy could tip briefly, reset its reference and step on freely --
+    exactly the kind of loophole this task's history says gets found."""
+    task = _drift_task()
+    _lean_to(task, 1.0)
+    _place_feet(task, 0.0)
+    task._settle_drift()
+    assert task._drift_settled.all()
+
+    # Tip well past the settle threshold and walk away.
+    _lean_to(task, 25.0)
+    _place_feet(task, 0.30)
+    task._settle_drift()
+
+    assert task._drift_settled.all(), "the latch released"
+    assert task._front_feet_anchor[0, 0, 0].item() == pytest.approx(0.0), (
+        "tipping re-planted the anchor"
+    )
+    assert task._foot_drift().item() == pytest.approx(0.30)
+
+
+def test_drift_past_the_limit_is_charged_and_the_limit_separates_the_two_policies():
+    """Calibration against the two measured policies, replayed over 153k
+    env-steps each. Sized on the good policy's WORST case, not its median:
+    iteration 1450 runs 4.7 cm median and 8.7 cm p90 but reaches 18.8 cm, so
+    a 0.20 m limit would have clipped its tail for nothing. The walker runs
+    57 cm median."""
+    limit = Go2StandCfg.termination.max_foot_drift
+    assert limit > 0.188, "would clip the good policy's worst observed step"
+    assert limit < 0.57, "would not end the walker's episodes"
+
+    task = _drift_task()
+    _lean_to(task, 1.0)
+    task._settle_drift()
+
+    for good in (0.047, 0.087, 0.188):  # median, p90, worst seen
+        _place_feet(task, good)
+        assert task._foot_drift().item() < limit
+    _place_feet(task, 0.573)  # the walker
+    assert task._foot_drift().item() > limit
+    # And it is priced, not merely fatal.
+    assert task._reward_front_feet_drift().item() < 0.0

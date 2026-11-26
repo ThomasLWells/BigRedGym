@@ -212,10 +212,30 @@ class Go2StandCfg(Go2Cfg):
         # Radians of attitude error past which the fall is unrecoverable. The
         # zero-action trace crosses 0.3 rad while still roughly upright and
         # reaches 1.414 rad lying flat, so 0.6 ends the episode without cutting
-        # off recovery attempts. A sample-efficiency gate: no reward term
-        # mentions attitude, so without it most of the rollout would be spent
-        # collecting samples from a robot that is already down.
+        # off recovery attempts. A sample-efficiency gate, deliberately far
+        # looser than _reward_balance_attitude, which is what holds the pose.
         max_attitude_error = 0.6
+
+        # Metres a support foot may travel from where the handstand SETTLED
+        # before the episode ends. Walking is not a handstand, and pricing it
+        # was not enough: the policy that trained without this held 1.2 deg of
+        # lean and perfect balance while covering 57 cm from a motionless
+        # start, because surviving paid far more than the drift term cost.
+        #
+        # Safe only because the anchor latches -- see Go2Stand._settle_drift.
+        # Until the robot is upright the anchor follows its feet, so drift
+        # reads ~0 and this cannot fire; stepping to recover from a 29 deg
+        # spawn is never fatal. The two are a pair, and this threshold alone
+        # would starve exactly the recovery the curriculum exists to teach.
+        #
+        # Sized on the MAX of a good policy, not its median. Replaying the two
+        # measured policies over 153k env-steps each: the good one (iteration
+        # 1450) runs 4.7 cm median, 8.7 cm p90 -- but 18.8 cm at its worst.
+        # The walker runs 57 cm median, 85 cm max. A 0.20 m limit would have
+        # left the good policy only 6% of headroom and clipped its tail
+        # excursions for nothing; 0.30 gives it 1.6x its observed worst case
+        # while still ending the walker's episodes in well under a second.
+        max_foot_drift = 0.30
 
     class curriculum:
         # Stage energies, from HandstandPendulum.schedule -- see the
@@ -327,6 +347,13 @@ class Go2StandCfg(Go2Cfg):
         # gain from 15 deg to vertical is 1.28 per unit weight here and 1.13
         # at 0.21. The weight is the knob for the escape.
         attitude_tolerance = 0.0872
+        # Chord at which the handstand counts as ACHIEVED, latching the foot
+        # drift anchor. Below this the robot is still righting itself and its
+        # anchor follows its feet, so stepping to get upright costs nothing;
+        # at this point the anchor freezes and every centimetre after is
+        # charged. 0.15 is 8.6 deg -- the same value as
+        # curriculum.hold_attitude_error, because it means the same thing.
+        drift_settle_attitude = 0.15
 
         # Load-bearing even though _reward_com_height is zero-weighted: it is
         # the pendulum length in the angular-momentum normalizer.

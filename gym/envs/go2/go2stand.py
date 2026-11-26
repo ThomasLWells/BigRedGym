@@ -107,15 +107,20 @@ class Go2Stand(Go2):
         self._support_anchor = torch.zeros(
             self.num_envs, 3, dtype=torch.float, device=self.device
         )
-        # Where each support foot was planted, pinned at reset. The reference
-        # for foot drift, which is a "how far has this foot moved" question
-        # rather than part of the pendulum's state.
+        # Where each support foot is standing. The reference for foot drift,
+        # which is a "how far has this foot moved" question rather than part
+        # of the pendulum's state. NOT simply pinned at reset: it follows the
+        # feet until the handstand is achieved and freezes there -- see
+        # _settle_drift.
         self._front_feet_anchor = torch.zeros(
             self.num_envs,
             len(self.front_feet_indices),
             2,
             dtype=torch.float,
             device=self.device,
+        )
+        self._drift_settled = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
         )
         # Rows are the support frame's x and y axes in world coordinates: y
         # along the contact line, x perpendicular to it. This buys the rewards
@@ -497,14 +502,17 @@ class Go2Stand(Go2):
             self.dof_pos_target.tile(1, 3),
             reset_mask,
         )
-        # Re-plant the drift reference. The backend has already run a forward
+        # Re-plant the drift reference and un-latch it, so the new episode may
+        # step itself upright again. The backend has already run a forward
         # pass and re-synced the assembled states, so these foot positions are
-        # genuinely post-reset.
+        # genuinely post-reset. Without the un-latch, one episode's settled
+        # anchor would charge the next episode for its recovery.
         masked_update(
             self._front_feet_anchor,
             self._rigid_body_pos[:, self.front_feet_indices, :2],
             reset_mask,
         )
+        self._drift_settled.masked_fill_(reset_mask, False)
         # Here rather than in _refresh_base_observations, which runs earlier
         # inside super() and is its only caller; doing it here covers the
         # reset path with post-reset state.
@@ -522,6 +530,9 @@ class Go2Stand(Go2):
         self._update_support_frame()
         self._update_reduced_order_state()
         self._update_foot_slip()
+        # After _update_support_frame, so the foot positions it plants are
+        # this step's. Before the terminations, which read the drift it sets.
+        self._settle_drift()
         self._accumulate_hold_quality()
 
     def _accumulate_hold_quality(self):
@@ -542,6 +553,58 @@ class Go2Stand(Go2):
         scoring = (self.episode_length_buf >= self._hold_start_step).float()
         self._hold_error_sum += self._attitude_error() * scoring
         self._hold_error_steps += scoring
+
+    def _foot_drift(self):
+        """Metres the furthest support foot has travelled from its anchor.
+
+        Max over the pair, not mean: a pivot about one planted foot sweeps the
+        other through twice the distance a mean would report, halving the cost
+        of exactly the behaviour this exists to measure.
+
+        One definition for the reward and the termination, so the two cannot
+        drift apart. What the anchor means is set by _settle_drift.
+        """
+        travel = (
+            self._rigid_body_pos[:, self.front_feet_indices, :2]
+            - self._front_feet_anchor
+        )
+        return torch.amax(torch.norm(travel, dim=-1), dim=1)
+
+    def _settle_drift(self):
+        """Let the robot step itself upright, then hold it where it landed.
+
+        Foot drift is measured from ``_front_feet_anchor``. Until the trunk is
+        actually upright that anchor FOLLOWS the feet, so drift reads ~0 and
+        stepping costs nothing -- neither in the reward nor in the drift
+        termination. The moment the handstand is achieved the anchor freezes
+        where the feet are standing, and every centimetre after that is
+        charged.
+
+        This is what makes the drift termination safe. Recovering from a 29
+        degree spawn genuinely requires stepping -- the energy has to go
+        somewhere -- and a flat drift limit would kill exactly the recovery
+        the curriculum exists to teach. Separating "getting there" from
+        "staying there" lets both be priced correctly.
+
+        The latch is PERMANENT for the episode. Releasing it whenever the
+        trunk tipped would hand the policy an obvious loophole given this
+        task's history: tip briefly to re-plant the anchor, then step freely.
+        A policy that instead never becomes upright is already charged by
+        _reward_balance_attitude and already fails the curriculum's hold
+        criterion, so refusing to settle is not an escape either.
+        """
+        settling = ~self._drift_settled
+        # Re-plant for everyone not yet settled, INCLUDING those crossing the
+        # threshold on this very step, so the anchor lands exactly where the
+        # handstand was achieved rather than a step late.
+        masked_update(
+            self._front_feet_anchor,
+            self._rigid_body_pos[:, self.front_feet_indices, :2],
+            settling,
+        )
+        self._drift_settled |= settling & (
+            self._attitude_error() <= self.cfg.reward_settings.drift_settle_attitude
+        )
 
     def _attitude_error(self):
         """Chord on the unit sphere between the trunk's gravity direction and
@@ -567,6 +630,15 @@ class Go2Stand(Go2):
         # Stage-dependent, not the raw config value -- see
         # _apply_curriculum_stage.
         self.terminated |= self._attitude_error() > self._max_attitude_error
+
+        # Walking is not a handstand. Pricing it was not enough: a policy
+        # trained with drift at weight 2.0 and nothing else held 1.2 degrees
+        # of lean and perfect balance while covering 57 cm from a motionless
+        # start, because surviving paid more than the drift cost.
+        #
+        # Measured from the SETTLED anchor, so this cannot fire while the
+        # robot is still righting itself -- see _settle_drift.
+        self.terminated |= self._foot_drift() > self.cfg.termination.max_foot_drift
 
     def _reward_orientation(self):
         """Inherited from Go2 and WRONG here -- refuse it rather than let it
@@ -966,14 +1038,7 @@ class Go2Stand(Go2):
         The log tail is what keeps that accumulation from saturating the term
         into a constant -- see _shaped_log_tail.
         """
-        drift = (
-            self._rigid_body_pos[:, self.front_feet_indices, :2]
-            - self._front_feet_anchor
-        )
-        error = (
-            torch.amax(torch.norm(drift, dim=-1), dim=1)
-            / self.cfg.reward_settings.foot_drift_tolerance
-        )
+        error = self._foot_drift() / self.cfg.reward_settings.foot_drift_tolerance
         return self._shaped_log_tail(error)
 
     def _reward_front_feet_support(self):
