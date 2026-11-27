@@ -520,6 +520,28 @@ class Go2Stand(Go2):
         self._update_reduced_order_state()
         self._update_foot_slip()
 
+    def _pre_decimation_step(self):
+        """Bound the commanded PD target before anything reads it.
+
+        The actor is an unsquashed Gaussian and nothing between it and the
+        torques bounds its output, so the action is limited only by whatever
+        the network happens to produce. With no actuation cost in the reward
+        that turned into a policy commanding 132 rad of joint target -- more
+        than twenty revolutions of a joint with about two of travel -- which
+        drove joints to 173 rad/s against the calf's 15.7 rad/s rating and
+        pinned torque at its clip 89.5% of the time.
+
+        Here rather than in the reward, because a weight is a preference and
+        this is a fact about the robot. Here rather than in _compute_torques,
+        because this runs once per control step before the decimation loop
+        and before dof_pos_history records the target -- so the torques, the
+        action-rate penalties and the observation all see the same clipped
+        value rather than disagreeing about what was commanded.
+        """
+        super()._pre_decimation_step()
+        limit = self.cfg.control.max_dof_pos_target
+        self.dof_pos_target.clamp_(-limit, limit)
+
     def _post_decimation_step(self):
         super()._post_decimation_step()
         # Control rate, alongside projected_gravity. super() first, because
@@ -908,6 +930,45 @@ class Go2Stand(Go2):
             / self.cfg.reward_settings.yaw_momentum_tolerance
         )
         return self._shaped_log_tail(error)
+
+    def _reward_dof_vel_limits(self):
+        """Charge for joint speed past what the motor is rated for.
+
+        Overridden rather than inherited. The base version clips the excess
+        at 1 rad/s per joint, so past 0.9 * rating + 1 it is a CONSTANT --
+        15.1 rad/s for the calf, against measured speeds of 173. A constant
+        is invisible to PPO at any weight, and this task has already lost 900
+        iterations to exactly that (see _shaped_log_tail). The term has to
+        keep pulling where the behaviour actually is.
+
+        The same logarithmic tail every shaped term here uses, for the same
+        reason: bounded in practice, never flat. The clamp at 200 rad/s of
+        excess is a floor guard, not a shaping choice -- it puts the term at
+        -1.06 and nothing reaches it.
+
+        Max over the joints, not mean, for the reason _reward_front_feet_drift
+        takes the max over the pair: one joint at eleven times its rating is
+        the fault, and averaging it against eleven well-behaved joints divides
+        the signal by twelve. Measured on the blown-up policy the mean form
+        reads -0.036 against the good policy's -0.001 -- a real ratio but
+        both so close to zero that no sane weight makes it matter.
+
+        Why this is needed on top of control.max_dof_pos_target: the action
+        clip bounds what is COMMANDED, not what the joint does. At the calf's
+        45.43 Nm against 0.0119 kg m^2 the motor delivers 3820 rad/s^2, which
+        covers the whole 15.7 rad/s rating in 4.1 ms -- under half a control
+        step. The torque limit therefore cannot bound speed at 100 Hz, and
+        measured per-step accelerations reach 9221 rad/s^2, 2.4x what the
+        strongest joint can produce, so contact and solver error add to it.
+        The physically correct fix is a torque-speed curve in the actuator
+        model; this is the cheap approximation of it, and being a reward
+        rather than a constraint it can be outbid.
+        """
+        excess = (
+            self.dof_vel.abs()
+            - self.dof_vel_limits * self.cfg.reward_settings.soft_dof_vel_limit
+        ).clamp(min=0.0, max=200.0)
+        return -0.2 * torch.log1p(torch.amax(excess, dim=1))
 
     def _reward_balance_attitude(self):
         """Trunk upright -> the pose is a handstand, not merely a balance.

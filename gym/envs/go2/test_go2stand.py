@@ -462,6 +462,29 @@ def test_dense_rewards_are_bounded_below_so_falling_beats_nothing():
     # does not inherit. If it is ever re-enabled it joins the sum above.
     assert not hasattr(weights, "com_height")
 
+    # Every configured weight must be accounted for, or this test quietly
+    # stops testing the thing it exists for. A new shaped term that nobody
+    # adds to `unbounded` would otherwise sail through while the alive bonus
+    # silently fails to cover it.
+    #
+    # The actuation penalties are excluded DELIBERATELY, not forgotten: they
+    # are bounded by control.max_dof_pos_target rather than by the alive
+    # bonus, and they are the policy's own choice rather than something a
+    # falling robot is forced into. See the balance_alive comment.
+    voluntary = {"action_rate", "action_rate2", "torques", "dof_vel_limits"}
+    accounted = (
+        set(unbounded)
+        | voluntary
+        | {"balance_attitude", "balance_alive"}
+        # a smoothstep in [0, 1]; cannot go negative, so it never enters
+        | {"front_feet_support"}
+    )
+    configured = {n for n in dir(weights) if not n.startswith("_")}
+    assert configured <= accounted, (
+        f"unaccounted reward weights: {sorted(configured - accounted)} -- "
+        "decide whether the alive bonus must cover them"
+    )
+
 
 def _slip_task(linear, angular, quaternion=(0.0, 0.0, 0.0, 1.0), load=1.0):
     """A Go2Stand carrying just the two front feet, moving as given.
@@ -766,3 +789,99 @@ def test_drift_past_the_limit_is_charged_and_the_limit_separates_the_two_policie
     assert task._foot_drift().item() > limit
     # And it is priced, not merely fatal.
     assert task._reward_front_feet_drift().item() < 0.0
+
+
+# ------------ the action clip ----------------
+
+
+def test_the_pd_target_is_clipped_to_something_a_joint_can_reach():
+    """The actor is an unsquashed Gaussian and nothing downstream bounds it.
+
+    Without this clip a trained policy commanded 132 rad of joint target --
+    twenty-one revolutions of a joint with about two of travel -- and drove
+    joints to 173 rad/s against the calf's 15.7 rad/s URDF rating.
+    """
+    limit = Go2StandCfg.control.max_dof_pos_target
+    task = Go2Stand.__new__(Go2Stand)
+    task.cfg = Go2StandCfg()
+    task.dof_pos_target = torch.tensor([[131.8, -121.3, 0.39, -0.96, 0.0, 2.0]])
+    task._pre_decimation_step()
+
+    assert task.dof_pos_target.abs().max().item() <= limit
+    # What a working policy asks for must pass through untouched: the good
+    # checkpoint ran 0.39 rad at p99 and 0.96 at its worst.
+    torch.testing.assert_close(
+        task.dof_pos_target[0, 2:4], torch.tensor([0.39, -0.96]), atol=1e-6, rtol=0
+    )
+    assert limit > 0.96, "would constrain a policy already shown to work"
+    assert limit < 10.0, "too loose to bound the actuation penalties usefully"
+
+
+def test_the_clip_bounds_the_actuation_penalties():
+    """The reason the alive bonus does not have to cover them.
+
+    Each penalty is a mean square of target differences, so it is unbounded
+    for an unbounded action. Clipped to +/-C the one-step difference cannot
+    exceed 2C and the second difference 4C, which puts a floor under all
+    three -- without that, `balance_alive` would have to grow without limit.
+    """
+    c = Go2StandCfg.control.max_dof_pos_target
+    w = Go2StandRunnerCfg().critic.reward.weights
+
+    # action_rate sums a one-step (<= 2C) and a half two-step (<= C) square.
+    rate_floor = -((2 * c) ** 2 + c**2) * w.action_rate
+    # action_rate2 is a second difference, so <= 4C.
+    rate2_floor = -((4 * c) ** 2) * w.action_rate2
+
+    assert rate_floor > -2.0 and rate2_floor > -2.5, (
+        "the clip no longer bounds the actuation penalties usefully"
+    )
+    # Bounded, but big enough that excluding them from the positivity
+    # inequality is a real decision rather than a rounding error.
+    assert rate_floor + rate2_floor < -1.0
+
+
+def test_joint_speed_penalty_keeps_pulling_past_the_rating():
+    """The inherited version clips the excess at 1 rad/s per joint, so past
+    0.9 * rating + 1 it is a CONSTANT -- 15.1 rad/s for the calf, against
+    measured speeds of 173. A constant is invisible to PPO at any weight,
+    which is the failure that left front_feet_drift inert for 900
+    iterations. This override has to keep pulling the whole way out."""
+    task = Go2Stand.__new__(Go2Stand)
+    task.cfg = Go2StandCfg()
+    # Twelve joints rated as the Go2 is: hip, thigh, calf per leg.
+    task.dof_vel_limits = torch.tensor(4 * [30.1, 30.1, 15.7])
+    task.dof_vel = torch.zeros(4, 12)
+
+    # One calf joint swept well past its rating; the rest are at rest.
+    for row, speed in enumerate((0.0, 20.0, 80.0, 173.0)):
+        task.dof_vel[row, 2] = speed
+    scores = task._reward_dof_vel_limits()
+
+    assert scores[0].item() == pytest.approx(0.0), "a joint within rating is free"
+    assert scores[1] > scores[2] > scores[3], "the tail must not go flat"
+    # And it is a real push, not a rounding artefact, in the band the
+    # inherited version flattens entirely.
+    assert scores[1] - scores[3] > 0.2
+
+
+def test_joint_speed_penalty_takes_the_max_not_the_mean():
+    """One joint at eleven times its rating is the fault; averaging it
+    against eleven well-behaved joints divides the signal by twelve. With the
+    mean form the two measured policies read -0.001 and -0.036, both close
+    enough to zero that no sane weight separates them."""
+    task = Go2Stand.__new__(Go2Stand)
+    task.cfg = Go2StandCfg()
+    task.dof_vel_limits = torch.tensor(4 * [30.1, 30.1, 15.7])
+
+    task.dof_vel = torch.zeros(1, 12)
+    task.dof_vel[0, 2] = 100.0
+    one_bad = task._reward_dof_vel_limits().item()
+
+    task.dof_vel = torch.full((1, 12), 100.0)
+    all_bad = task._reward_dof_vel_limits().item()
+
+    assert one_bad == pytest.approx(all_bad, rel=0.3), (
+        "a single screaming joint must not be diluted by its quiet neighbours"
+    )
+    assert one_bad < -0.5

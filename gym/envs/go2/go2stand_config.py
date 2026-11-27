@@ -201,6 +201,25 @@ class Go2StandCfg(Go2Cfg):
         stiffness = {"hip": 30.0, "thigh": 30.0, "calf": 30.0}
         damping = {"hip": 1.0, "thigh": 1.0, "calf": 1.0}
 
+        # Radians the PD target may sit from the default pose, clipped in
+        # Go2Stand._pre_decimation_step. The actor is an UNSQUASHED Gaussian
+        # and nothing downstream bounds it, so without this the action is
+        # limited only by what the network happens to output.
+        #
+        # It stopped being hypothetical. Measured on two trained policies:
+        # the good one (Nov25 iteration 1450) commands |target| of 0.39 rad at
+        # p99 and 0.96 at its worst, while the policy that followed commanded
+        # 121 rad at p99 and 132 at its worst -- twenty-one full revolutions
+        # of a joint that physically travels about two. That drove joints to
+        # 173 rad/s against a URDF rating of 15.7 for the calf, with torque
+        # pinned at the clip 89.5% of the time.
+        #
+        # 1.5 is 1.6x the good policy's observed worst case, so it is not a
+        # constraint on anything that works, and 80x below what the blown-up
+        # policy was asking for. It also BOUNDS the three actuation penalties
+        # below, which an unclipped action does not -- see the weights block.
+        max_dof_pos_target = 1.5
+
     class domain_randomization(Go2Cfg.domain_randomization):
         class startup(Go2Cfg.domain_randomization.startup):
             # A handstand lives or dies on the front feet not slipping, so the
@@ -560,6 +579,44 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # Separate from balance_momentum so it cannot swamp the pitch
                 # gradient -- see Go2Stand._reward_balance_yaw.
                 balance_yaw = 1.0
+
+                # Actuation regularisation, the three weights go2trot uses --
+                # the only task here that produces physically plausible motion
+                # -- at exactly its values. go2stand previously weighted NONE
+                # of them, and the result was a policy running bang-bang:
+                # torque at the clip 89.5% of the time, the PD target slewing
+                # 1.7 rad per 10 ms control step, and joints reaching 173
+                # rad/s against a URDF rating of 15.7 for the calf, 11x over.
+                #
+                # These are penalties: each returns a negative mean square, so
+                # at the goal they contribute 0 and the goal total is
+                # unchanged. They are also the only terms here NOT bounded by
+                # their own shape -- control.max_dof_pos_target is what bounds
+                # them, see below.
+                action_rate = 0.1
+                action_rate2 = 0.05
+                torques = 5.0e-6
+                # Joint speed past the motor's rating, overridden in
+                # Go2Stand._reward_dof_vel_limits because the inherited
+                # version saturates 1 rad/s past the limit and would be a
+                # constant across the whole range that matters.
+                #
+                # 3.0 from the measured separation between the two policies:
+                # the good one (Nov25 iteration 1450) reads -0.010 on average
+                # and is charged at all on only 2.9% of steps, the blown-up
+                # one reads -0.347 and is charged on 68.6%. So this costs a
+                # working policy about 0.03 of a 22.5 total and a thrashing
+                # one about 1.04 -- real without being punitive.
+                #
+                # It is the cheap stand-in for a torque-speed curve. The
+                # motor model here delivers full torque at any speed, which
+                # the real one cannot, and at 3820 rad/s^2 the calf covers
+                # its entire 15.7 rad/s rating in 4.1 ms -- under half a
+                # control step. So nothing in the torque path bounds joint
+                # speed and this is a preference competing with survival
+                # rather than a limit. If joints still run past rating, the
+                # fix is the torque-speed curve in _compute_torques.
+                dof_vel_limits = 3.0
                 # Not a shaping term -- a constant that keeps the per-step
                 # total strictly positive. Without it, riding a fall down
                 # costs more per step than terminating does (-1e-4), so the
@@ -587,8 +644,27 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # 40% -- so the relative value of surviving versus balancing
                 # well has not moved.
                 #
-                # RAISE THIS IF YOU RAISE ANY OF THOSE WEIGHTS. A test asserts
-                # the inequality; a GPU run would not.
+                # The three actuation penalties are deliberately NOT in that
+                # inequality, and this is the one place the invariant is
+                # knowingly relaxed. They are bounded -- the action clip caps
+                # them at roughly -2.9 combined -- but covering that worst
+                # case would mean an alive bonus near 12.0, pushing the
+                # survive-at-all-costs pressure up by a further seven points
+                # of share, which is the pressure that produced a walking
+                # handstand in the first place.
+                #
+                # The distinction that makes this safe: the invariant exists
+                # because a FALLING robot cannot stop its momentum and offset
+                # terms blowing up, so without a floor it would learn that
+                # dying fast is cheaper than living. Actuation cost is not
+                # like that -- it is entirely the policy's own choice, zero at
+                # the start of training when actions are near zero, and
+                # reachable only by actively chattering at full amplitude,
+                # which these very terms punish. The corner exists but nothing
+                # pushes the policy into it.
+                #
+                # RAISE THIS IF YOU RAISE ANY OF THE SHAPED WEIGHTS. A test
+                # asserts the inequality; a GPU run would not.
                 balance_alive = 9.0
 
             class termination_weight:
