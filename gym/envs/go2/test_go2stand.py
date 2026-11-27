@@ -885,3 +885,36 @@ def test_joint_speed_penalty_takes_the_max_not_the_mean():
         "a single screaming joint must not be diluted by its quiet neighbours"
     )
     assert one_bad < -0.5
+
+
+def test_com_speed_is_the_recoverable_brake_on_translation():
+    """Calibrated against two measured policies, and the reason the weight
+    moved to com_vel_xy rather than up on front_feet_drift.
+
+    Drift measures accumulated displacement from a latched anchor, so it is a
+    sunk cost: once the robot has walked 17 cm, stopping cannot win that
+    reward back and walking 2.5 cm further costs 0.04. Speed is recoverable --
+    the step it stops moving, it stops paying. A policy measured at iteration
+    1000 walked at 0.116 m/s in a perfectly straight line and died on the
+    drift termination in 100% of its episodes; a good one runs at 0.011.
+    """
+    weights = Go2StandRunnerCfg().critic.reward.weights
+    good = _reward_task(com_vel=(0.011, 0.0, 0.0))._reward_com_vel_xy().item()
+    walk = _reward_task(com_vel=(0.116, 0.0, 0.0))._reward_com_vel_xy().item()
+
+    assert good > 0.85, "a policy holding still must sit near ceiling"
+    assert walk < 0.0, "the measured walk must be clearly priced"
+    # The gradient toward stopping has to be worth more than the drift term
+    # gives up by going soft in its tail -- that is the whole point.
+    assert (good - walk) * weights.com_vel_xy > 3.0
+
+    # And it must still be recoverable at any displacement: the term reads
+    # speed alone, so it cannot be a sunk cost the way drift is.
+    assert _reward_com_vel_xy_is_speed_only()
+
+
+def _reward_com_vel_xy_is_speed_only():
+    """A stopped robot scores the same wherever it stopped."""
+    near = _reward_task(com_vel=(0.0, 0.0, 0.0), drift=0.0)._reward_com_vel_xy()
+    far = _reward_task(com_vel=(0.0, 0.0, 0.0), drift=10.0)._reward_com_vel_xy()
+    return near.item() == pytest.approx(far.item())

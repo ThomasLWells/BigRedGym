@@ -422,7 +422,30 @@ class Go2StandCfg(Go2Cfg):
         # bottoms out. Resolution is concentrated at the low end, since that is
         # where this term says something balance_momentum does not; in a real
         # fall the two saturate together.
-        com_vel_tolerance = 0.25
+        # TIGHTENED from 0.25 because this is the only RECOVERABLE term that
+        # prices translation, and it turned out to be the one that matters.
+        #
+        # front_feet_drift measures accumulated displacement from a latched
+        # anchor, so once the robot has walked 17 cm that reward is gone and
+        # stopping cannot win it back -- and out in the log tail, walking a
+        # further 2.5 cm costs 0.04. A policy measured at iteration 1000 had
+        # learned exactly what that implies: a perfectly directed walk at
+        # 0.116 m/s (|mean displacement| / mean |displacement| = 1.00), dying
+        # on the 30 cm drift termination in 100% of its episodes while never
+        # once falling over. Speed is different -- the moment it stops moving
+        # it stops paying, at any displacement.
+        #
+        # 0.10 separates the two measured behaviours: a good policy runs at
+        # 0.011 m/s and scores 0.93, the walker at 0.116 scores -0.15.
+        #
+        # The cost, and it is real: the curriculum spawn carries a CoM speed
+        # the policy does not choose -- r * theta_dot, so 0.11 m/s at stage 0
+        # rising to 1.9 at stage 18 -- and this charges that harder than 0.25
+        # did. It is a transient of well under a second in a ten second
+        # episode, and the curriculum's own hold criterion already scores only
+        # the episode tail, but if the far stages stall this is the first
+        # thing to re-examine.
+        com_vel_tolerance = 0.10
         # In units of m*h*sqrt(g*h) = 22.6 kg m^2/s, the momentum of the whole
         # robot tipping at the pendulum's natural rate. Per axis of the support
         # frame, and note this is the OPPOSITE assignment to
@@ -558,7 +581,14 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 # chooses how it balances.
                 balance_momentum = 3.0
                 balance_offset = 2.0
-                com_vel_xy = 1.0
+                # Raised 1.0 -> 4.0. The task's only recoverable brake on
+                # translation: drift is a sunk cost once the anchor latches,
+                # speed is not. At the measured walking speed this costs the
+                # policy 0.6 against the 4.0 it would collect by stopping, so
+                # there is a live 4.6-point gradient toward standing still at
+                # every displacement -- which the drift term stopped
+                # providing past about 10 cm.
+                com_vel_xy = 4.0
                 # NOT a reduced-order term despite the prefix -- it names the
                 # trunk. It exists because the reduced-order state cannot see
                 # a lean: the rear legs are exactly the redundancy that puts
@@ -635,9 +665,17 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 #                               + front_feet_drift)
                 #                      + 0.635 * balance_attitude
                 #
-                # Here 0.743 * 9 + 0.635 * 3 = 8.59, against 9.0 -> worst case
-                # +0.41. (front_feet_support is a smoothstep in [0, 1] and
-                # cannot go negative, so it never enters.)
+                # Here 0.743 * 12 + 0.635 * 3 = 10.82, against 11.5 -> worst
+                # case +0.68. (front_feet_support is a smoothstep in [0, 1]
+                # and cannot go negative, so it never enters.)
+                #
+                # Raised 9.0 -> 11.5 with com_vel_xy. Note this now cuts the
+                # right way: the measured failure is a policy that walks into
+                # the drift termination in 100% of its episodes and never
+                # falls, so a larger alive bonus makes dying there cost more
+                # forgone return. The earlier worry that a big alive bonus
+                # drives walking had it backwards -- walking is what kills
+                # this policy, not what keeps it alive.
                 #
                 # Raised from 7.0 with balance_attitude. Note the ratio to the
                 # shaped sum is preserved -- 7.0/17.5 and 9.0/22.5 are both
@@ -665,7 +703,7 @@ class Go2StandRunnerCfg(Go2RunnerCfg):
                 #
                 # RAISE THIS IF YOU RAISE ANY OF THE SHAPED WEIGHTS. A test
                 # asserts the inequality; a GPU run would not.
-                balance_alive = 9.0
+                balance_alive = 11.5
 
             class termination_weight:
                 # The terminal reward is -weight * dt, so this is tiny by
